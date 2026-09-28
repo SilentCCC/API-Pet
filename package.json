@@ -1,0 +1,28 @@
+{
+  "name": "api-pet",
+  "version": "0.1.85",
+  "description": "A cute Windows desktop pet that provides a local AI API gateway.",
+  "main": "src/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron .",
+    "dist": "electron-builder --win"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "build": {
+    "appId": "com.apipet.desktop",
+    "productName": "API Pet",
+    "files": [
+      "src/**/*",
+      "package.json"
+    ],
+    "win": {
+      "target": "nsis"
+    }
+  },
+  "allowScripts": {}
+}
+

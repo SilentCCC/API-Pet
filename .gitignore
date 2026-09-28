@@ -1,0 +1,45 @@
+# Dependencies and generated builds
+node_modules/
+dist/
+out/
+release/
+*.asar
+
+# Runtime logs and temporary files
+*.log
+LOG.md
+logs/
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.swp
+.DS_Store
+Thumbs.db
+
+# Local application state
+api-pet.json
+**/api-pet.json
+userData/
+user-data/
+sessions/
+
+# Environment files and private credentials
+.env
+.env.*
+!.env.example
+*.secret
+*.secrets
+*.credential
+*.credentials
+*.token
+*.cookie
+*.key
+*.pem
+*.p12
+*.pfx
+credentials*.json
+secrets*.json
+tokens*.json
+cookies*.json

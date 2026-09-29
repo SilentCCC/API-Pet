@@ -122,7 +122,8 @@ async function setChatVisible(visible) {
 }
 
 function toast(message) {
-  const el = $('toast');
+  const el = dialog?.open ? $('dialogToast') : $('toast');
+  if (!el) return;
   el.textContent = message;
   el.classList.add('show');
   setTimeout(() => el.classList.remove('show'), 2400);
@@ -205,7 +206,7 @@ function render() {
   $('lowThreshold').value = appState.balanceSettings?.lowThreshold ?? 5;
   $('refreshMinutes').value = appState.balanceSettings?.refreshMinutes ?? 10;
   const allProvidersCollapsed = providersCollapsed || (appState.providers.length > 0 && appState.providers.every(provider => collapsedProviderIds.has(provider.id)));
-  $('refreshAllAccounts').disabled = refreshingAllAccounts || appState.providers.every(provider => provider.balanceAdapter !== 'sub2api');
+  $('refreshAllAccounts').disabled = refreshingAllAccounts || appState.providers.every(provider => !['sub2api', 'new-api'].includes(provider.balanceAdapter));
   $('toggleProviders').textContent = allProvidersCollapsed ? '展开全部' : '折叠全部';
   $('toggleProviders').setAttribute('aria-expanded', String(!allProvidersCollapsed));
   const list = $('providers');
@@ -227,7 +228,7 @@ function render() {
     const averageResponseMs = accountStats.averageDurationMs != null ? Number(accountStats.averageDurationMs) : NaN;
     const averageResponse = Number.isFinite(averageResponseMs) ? `${(averageResponseMs / 1000).toFixed(2)} 秒` : '--';
     const consumption = hasAccountStats ? `${escapeHtml(provider.currency || balance.currency || '$')}${Number(accountStats.todayCost).toFixed(4)}` : Number.isFinite(Number(stats.cost)) ? `${escapeHtml(stats.costCurrency || provider.currency || '$')}${Number(stats.cost).toFixed(4)}` : Number(stats.usageTokens) > 0 ? `${Number(stats.usageTokens).toLocaleString()} tokens` : '--';
-    const connectButton = provider.balanceAdapter === 'sub2api' ? '<button class="connect-account">连接账户</button>' : '';
+    const connectButton = ['sub2api', 'new-api'].includes(provider.balanceAdapter) ? '<button class="connect-account">连接账户</button>' : '';
     const displayUrl = provider.requestUrl || provider.loginUrl || provider.baseUrl || '';
   const balanceConnection = balance.apiStatus === 'online' ? '🟢 连接正常' : balance.apiStatus === 'error' ? '🔴 连接失败' : '🟡 未测试';
   const connectionIcon = provider.status === 'online' ? '🟢' : provider.status === 'error' ? '🔴' : '🟡';
@@ -303,16 +304,16 @@ function fillProviderDialog(provider = {}) {
     : [{ key: provider.apiKey || '', remark: provider.tokenRemark || '', enabled: true }];
   renderTokenRows();
   $('accountToken').value = provider.accountToken || '';
-  $('balanceAdapter').value = provider.balanceAdapter || 'custom';
+  $('accountUserId').value = provider.accountUserId || '';
+  $('balanceAdapter').value = provider.balanceAdapter || 'sub2api';
   $('balanceUrl').value = provider.balanceUrl || '';
   $('balanceMethod').value = provider.balanceMethod || 'GET';
   $('balancePath').value = provider.balancePath || 'data.balance';
   $('remainingPath').value = provider.remainingPath || '';
   $('currency').value = provider.currency || '$';
-  $('connectAccountInDialog').classList.toggle('hidden', $('balanceAdapter').value !== 'sub2api');
-  $('importProviderTokens')?.classList.toggle('hidden', $('balanceAdapter').value !== 'sub2api');
-  const supportsAccountLogin = $('balanceAdapter').value === 'sub2api';
+  const supportsAccountLogin = ['sub2api', 'new-api'].includes($('balanceAdapter').value);
   $('accountTokenField').classList.toggle('hidden', !supportsAccountLogin);
+  $('accountUserIdField').classList.toggle('hidden', $('balanceAdapter').value !== 'new-api');
   ['balanceUrlField', 'balanceMethodField', 'balancePathField', 'remainingPathField'].forEach(id => $(id)?.classList.toggle('hidden', supportsAccountLogin));
 }
 function ensureTokenRemarkField() {
@@ -329,8 +330,7 @@ function ensureTokenRemarkField() {
 function renderTokenRows() {
   const fields = $('tokenFields');
   if (!fields) return;
-  fields.innerHTML = `<div class="token-row token-header"><span></span><div class="token-column-head"><span class="token-field-title">API Key</span></div><div class="token-column-head"><span class="token-field-title">令牌备注</span></div><div class="token-row-actions token-header-actions"><button type="button" id="importProviderTokens" class="ghost small token-import hidden">导入令牌</button></div></div>${providerTokenRows.map((row, index) => `<div class="token-row" data-token-index="${index}"><input class="token-enabled" type="checkbox" title="使用此 API Key" ${row.enabled !== false ? 'checked' : ''}><div class="token-column"><div class="secret-input"><input id="token-key-${index}" class="token-key" type="password" value="${escapeHtml(row.key)}" placeholder="sk-xxxxxxxx"><button type="button" class="toggle-token-key toggle-secret" aria-label="显示 API Key" title="显示 API Key"><span class="eye-icon" aria-hidden="true"></span></button></div></div><div class="token-column"><input id="token-remark-${index}" class="token-remark" value="${escapeHtml(row.remark)}" placeholder="例如 主账号 / GPT 专用"></div><div class="token-row-actions"><div class="token-row-action-buttons"><button type="button" class="add-token" title="增加 API Key">＋</button><button type="button" class="remove-token" title="删除 API Key" ${providerTokenRows.length <= 1 ? 'disabled' : ''}>−</button></div></div></div>`).join('')}`;
-  $('importProviderTokens')?.classList.toggle('hidden', $('balanceAdapter').value !== 'sub2api');
+  fields.innerHTML = `<div class="token-row token-header"><span></span><div class="token-column-head"><span class="token-field-title">API Key</span></div><div class="token-column-head"><span class="token-field-title">令牌备注</span></div><div class="token-row-actions token-header-actions"><button type="button" id="importProviderTokens" class="ghost small token-import">导入令牌</button></div></div>${providerTokenRows.map((row, index) => `<div class="token-row" data-token-index="${index}"><input class="token-enabled" type="checkbox" title="使用此 API Key" ${row.enabled !== false ? 'checked' : ''}><div class="token-column"><div class="secret-input"><input id="token-key-${index}" class="token-key" type="password" value="${escapeHtml(row.key)}" placeholder="sk-xxxxxxxx"><button type="button" class="toggle-token-key toggle-secret" aria-label="显示 API Key" title="显示 API Key"><span class="eye-icon" aria-hidden="true"></span></button></div></div><div class="token-column"><input id="token-remark-${index}" class="token-remark" value="${escapeHtml(row.remark)}" placeholder="例如 主账号 / GPT 专用"></div><div class="token-row-actions"><div class="token-row-action-buttons"><button type="button" class="add-token" title="增加 API Key">＋</button><button type="button" class="remove-token" title="删除 API Key" ${providerTokenRows.length <= 1 ? 'disabled' : ''}>−</button></div></div></div>`).join('')}`;
   $('importProviderTokens')?.addEventListener('click', importProviderTokens);
   fields.querySelectorAll('.token-row[data-token-index]').forEach(row => {
     const index = Number(row.dataset.tokenIndex);
@@ -376,8 +376,9 @@ function collectProviderDraft() {
     name: $('providerName').value.trim(),
     loginUrl: $('loginUrl').value.trim(),
     requestUrl: $('requestUrl').value.trim(),
-    balanceAdapter: $('balanceAdapter').value,
+    balanceAdapter: $('balanceAdapter').value || 'sub2api',
     accountToken: $('accountToken').value.trim(),
+    accountUserId: $('accountUserId').value.trim(),
     accountCookie: draftAccountData?.accountCookie || '',
     currency: $('currency').value
   };
@@ -389,7 +390,7 @@ async function saveProviderAndTest() {
   if (!form.reportValidity()) return;
   const apiKeys = providerTokenRows.map(row => ({ key: String(row.key || '').trim(), remark: String(row.remark || '').trim(), enabled: row.enabled !== false })).filter(row => row.key);
   if (!apiKeys.some(row => row.enabled)) { toast('请至少勾选一个有效 API Key'); return; }
-  appState = await window.apiPet.saveProvider({ id: editingId, name: $('providerName').value, loginUrl: $('loginUrl').value, requestUrl: $('requestUrl').value, apiKeys, apiKey: apiKeys.find(row => row.enabled)?.key || apiKeys[0]?.key || '', tokenRemark: apiKeys.find(row => row.enabled)?.remark || '', accountToken: $('accountToken').value, accountCookie: draftAccountData?.accountCookie || '', accountStats: draftAccountData?.accountStats || null, balance: draftAccountData?.balance || null, balanceAdapter: $('balanceAdapter').value, balanceUrl: $('balanceUrl').value, balanceMethod: $('balanceMethod').value, balancePath: $('balancePath').value, remainingPath: $('remainingPath').value, currency: $('currency').value });
+  appState = await window.apiPet.saveProvider({ id: editingId, name: $('providerName').value, loginUrl: $('loginUrl').value, requestUrl: $('requestUrl').value, apiKeys, apiKey: apiKeys.find(row => row.enabled)?.key || apiKeys[0]?.key || '', tokenRemark: apiKeys.find(row => row.enabled)?.remark || '', accountToken: $('accountToken').value, accountCookie: draftAccountData?.accountCookie || '', accountUserId: $('accountUserId').value, accountStats: draftAccountData?.accountStats || null, balance: draftAccountData?.balance || null, balanceAdapter: $('balanceAdapter').value, balanceUrl: $('balanceUrl').value, balanceMethod: $('balanceMethod').value, balancePath: $('balancePath').value, remainingPath: $('remainingPath').value, currency: $('currency').value });
   dialog.close();
   render();
   const provider = appState.providers.find(item => item.id === editingId) || appState.providers.at(-1);
@@ -434,8 +435,14 @@ async function connectProviderAccount(id, loginUrl = '', { silent = false } = {}
     if (result.ok && !id && result.provider) {
       draftAccountData = result.provider;
       $('accountToken').value = result.provider.accountToken || '';
+      $('accountUserId').value = result.provider.accountUserId || '';
+      if (result.provider.balanceAdapter) {
+        $('balanceAdapter').value = result.provider.balanceAdapter;
+        $('balanceAdapter').dispatchEvent(new Event('change'));
+      }
     } else if (result.ok && editingId === id) {
       $('accountToken').value = appState.providers.find(provider => provider.id === id)?.accountToken || '';
+      $('accountUserId').value = appState.providers.find(provider => provider.id === id)?.accountUserId || '';
     }
     render();
     if (!silent) toast(result.ok ? '账户已连接，余额和今日统计已更新' : `连接失败：${result.error}`);
@@ -448,7 +455,7 @@ async function connectProviderAccount(id, loginUrl = '', { silent = false } = {}
 }
 async function refreshAllProviderAccounts() {
   const button = $('refreshAllAccounts');
-  const providers = appState.providers.filter(provider => provider.balanceAdapter === 'sub2api');
+  const providers = appState.providers.filter(provider => ['sub2api', 'new-api'].includes(provider.balanceAdapter));
   if (!providers.length || refreshingAllAccounts) return;
   refreshingAllAccounts = true;
   button.disabled = true;
@@ -471,7 +478,7 @@ async function refreshAllProviderAccounts() {
   } finally {
     refreshingAllAccounts = false;
     button.textContent = '一键刷新账户';
-    button.disabled = appState.providers.every(provider => provider.balanceAdapter !== 'sub2api');
+    button.disabled = appState.providers.every(provider => !['sub2api', 'new-api'].includes(provider.balanceAdapter));
   }
 }
 let chatHistory = [];
@@ -693,6 +700,10 @@ function setStatus(data) {
   }
 }
 window.addEventListener('DOMContentLoaded', async () => {
+  const dialogToast = document.createElement('div');
+  dialogToast.id = 'dialogToast';
+  dialogToast.className = 'dialog-toast';
+  dialog.querySelector('.dialog-head')?.after(dialogToast);
   ensureChatTargetMenu();
   window.apiPet.onBalanceActivity(setBalanceActivity);
   appState = await window.apiPet.getState();
@@ -723,7 +734,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   $('saveBalanceSettings').onclick = async () => { appState = await window.apiPet.setBalanceSettings({ lowThreshold: $('lowThreshold').value, refreshMinutes: $('refreshMinutes').value }); render(); toast('余额设置已保存'); };
   $('routingEnabled').onchange = async () => { appState = await window.apiPet.setRoutingEnabled($('routingEnabled').checked); renderMode(); toast(appState.routingEnabled ? '已启用模型路由' : '已关闭模型路由'); };
   $('routingMode').onchange = async () => { appState = await window.apiPet.setRoutingMode($('routingMode').value); renderMode(); toast($('routingMode').value === 'unified' ? '已切换到统一路由模式' : '已切换到模型路由模式'); };
-  $('balanceAdapter').onchange = () => { const supportsAccountLogin = $('balanceAdapter').value === 'sub2api'; $('accountTokenField').classList.toggle('hidden', !supportsAccountLogin); $('connectAccountInDialog').classList.toggle('hidden', !supportsAccountLogin); $('importProviderTokens')?.classList.toggle('hidden', !supportsAccountLogin); ['balanceUrlField', 'balanceMethodField', 'balancePathField', 'remainingPathField'].forEach(id => $(id)?.classList.toggle('hidden', supportsAccountLogin)); };
+  $('balanceAdapter').onchange = () => { const supportsAccountLogin = ['sub2api', 'new-api'].includes($('balanceAdapter').value); $('accountTokenField').classList.toggle('hidden', !supportsAccountLogin); $('accountUserIdField').classList.toggle('hidden', $('balanceAdapter').value !== 'new-api'); ['balanceUrlField', 'balanceMethodField', 'balancePathField', 'remainingPathField'].forEach(id => $(id)?.classList.toggle('hidden', supportsAccountLogin)); };
   $('connectAccountInDialog').onclick = () => connectProviderAccount(editingId, $('loginUrl').value.trim());
   ensureTokenRemarkField();
   $('providerForm').onsubmit = event => event.preventDefault();
@@ -733,6 +744,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     button.type = 'button';
     button.onclick = () => dialog.close('cancel');
   });
+  dialog.addEventListener('close', () => $('dialogToast')?.classList.remove('show'));
   window.apiPet.onGatewayStatus(setStatus);
   window.apiPet.onShowPanel(() => setPanelVisible(true));
 });

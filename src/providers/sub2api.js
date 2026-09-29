@@ -21,7 +21,10 @@ async function getJson(url, headers, signal) {
   let body;
   try { body = JSON.parse(text); } catch { body = null; }
   if (!response.ok || (body?.code != null && body.code !== 0)) {
-    throw new Error(`${response.status} ${response.statusText}: ${body?.message || body?.error?.message || text.slice(0, 200)}`);
+    const error = new Error(`${response.status} ${response.statusText}: ${body?.message || body?.error?.message || text.slice(0, 200)}`);
+    error.status = response.status;
+    error.rateLimited = response.status === 429;
+    throw error;
   }
   return body?.data ?? body;
 }
@@ -29,6 +32,24 @@ async function getJson(url, headers, signal) {
 module.exports = {
   id: 'sub2api',
   label: 'Sub2API',
+  async detect(provider) {
+    const token = String(provider.accountToken || '').trim();
+    const cookie = String(provider.accountCookie || '').trim();
+    if (!token && !cookie) return notConfigured('Sub2API', '网页授权凭据');
+    const profileUrl = apiUrl(provider, 'user/profile');
+    if (!profileUrl) throw new Error('Sub2API 登录地址无效');
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    try {
+      const headers = { Accept: 'application/json', 'X-User-UI-Request': '1' };
+      if (token) headers.Authorization = `Bearer ${token}`;
+      if (cookie) headers.Cookie = cookie;
+      const profile = await getJson(profileUrl, headers, controller.signal);
+      return { profile };
+    } finally {
+      clearTimeout(timer);
+    }
+  },
   async getApiKeys(provider) {
     const token = String(provider.accountToken || '').trim();
     const cookie = String(provider.accountCookie || '').trim();
@@ -85,7 +106,7 @@ module.exports = {
       if (token) headers.Authorization = `Bearer ${token}`;
       if (cookie) headers.Cookie = cookie;
       const [profile, stats] = await Promise.all([
-        getJson(profileUrl, headers, controller.signal),
+        provider._accountProfile || getJson(profileUrl, headers, controller.signal),
         getJson(statsUrl, headers, controller.signal)
       ]);
       const user = profile?.user ?? profile;

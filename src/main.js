@@ -249,6 +249,7 @@ function normalizeProvider(provider) {
     tokenRemark: selectedKey.remark,
     accountToken: provider.accountToken || '',
     accountCookie: provider.accountCookie || '',
+    accountUserId: cleanAccountUserId(provider.accountUserId),
     balanceUrl: provider.balanceUrl || '',
     balanceMethod: provider.balanceMethod || 'GET',
     balancePath: provider.balancePath || 'data.balance',
@@ -367,8 +368,8 @@ async function queryProviderBalance(id) {
       };
       if (result.accountStats) {
         provider.accountStats = {
-          todayCost: Number(result.accountStats.todayCost),
-          todayRequests: Number(result.accountStats.todayRequests),
+          ...(result.accountStats.todayCost != null && Number.isFinite(Number(result.accountStats.todayCost)) ? { todayCost: Number(result.accountStats.todayCost) } : {}),
+          ...(result.accountStats.todayRequests != null && Number.isFinite(Number(result.accountStats.todayRequests)) ? { todayRequests: Number(result.accountStats.todayRequests) } : {}),
           ...(result.accountStats.todayTokens != null && Number.isFinite(Number(result.accountStats.todayTokens)) ? { todayTokens: Number(result.accountStats.todayTokens) } : {}),
           ...(result.accountStats.averageDurationMs != null && Number.isFinite(Number(result.accountStats.averageDurationMs)) ? { averageDurationMs: Number(result.accountStats.averageDurationMs) } : {}),
           updatedAt: now
@@ -409,29 +410,145 @@ function scheduleBalanceRefresh() {
 function sub2apiOrigin(provider) {
   try { return new URL(String(provider?.loginUrl || provider?.requestUrl || provider?.baseUrl || '')).origin; } catch { return ''; }
 }
+function isJwt(value) {
+  return /^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(String(value || '').trim());
+}
+function cleanSessionToken(value) {
+  const token = String(value || '').trim().replace(/^Bearer\s+/i, '');
+  if (!token || token.length < 16 || /\s/.test(token)) return '';
+  return token;
+}
+function cleanAccountUserId(value) {
+  if (value == null) return '';
+  const text = String(value).trim();
+  return text && text.length <= 200 ? text : '';
+}
+function accountUserIdFromValue(value, keyHint = '') {
+  if (value == null) return '';
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return '';
+    if (/^(uid|user_id|userId|userid|id)$/i.test(keyHint)) {
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed && typeof parsed === 'object') {
+          return accountUserIdFromValue(parsed.uid ?? parsed.user_id ?? parsed.userId ?? parsed.id, 'uid');
+        }
+      } catch {}
+      return cleanAccountUserId(text);
+    }
+    if (/user|auth|session|account|profile|uid/i.test(keyHint)) {
+      try {
+        const parsed = JSON.parse(text);
+        return accountUserIdFromValue(parsed?.uid ?? parsed?.user_id ?? parsed?.userId ?? parsed?.id, 'uid');
+      } catch {}
+    }
+    return '';
+  }
+  if (typeof value === 'number' || typeof value === 'bigint') return cleanAccountUserId(value);
+  if (typeof value === 'object') return accountUserIdFromValue(value.uid ?? value.user_id ?? value.userId ?? value.id, 'uid');
+  return '';
+}
+function tokenFromValue(value, keyHint = '', seen = new Set()) {
+  if (value == null) return '';
+  if (typeof value === 'string') {
+    const text = value.trim();
+    if (!text) return '';
+    if (isJwt(text)) return cleanSessionToken(text);
+    try {
+      const parsed = JSON.parse(text);
+      const nested = tokenFromValue(parsed, keyHint, seen);
+      if (nested) return nested;
+    } catch {}
+    if (/token|jwt|access|auth|session/i.test(keyHint)) return cleanSessionToken(text);
+    return '';
+  }
+  if (typeof value !== 'object' || seen.has(value)) return '';
+  seen.add(value);
+  const preferred = ['token', 'access_token', 'accessToken', 'userToken', 'authToken', 'jwt', 'authorization', 'sessionToken', 'loginToken'];
+  for (const key of preferred) {
+    if (Object.prototype.hasOwnProperty.call(value, key)) {
+      const nested = tokenFromValue(value[key], key, seen);
+      if (nested) return nested;
+    }
+  }
+  for (const [key, child] of Object.entries(value)) {
+    if (/token|jwt|access|auth|session/i.test(key)) {
+      const nested = tokenFromValue(child, key, seen);
+      if (nested) return nested;
+    }
+  }
+  return '';
+}
 async function readSub2apiCredentials(loginWindow, origin) {
-  const cookies = await loginWindow.webContents.session.cookies.get({ url: origin });
+  let cookies = [];
+  try { cookies = await loginWindow.webContents.session.cookies.get({ url: origin }); } catch {}
+  if (!cookies.length) {
+    try {
+      const hostname = new URL(origin).hostname;
+      const allCookies = await loginWindow.webContents.session.cookies.get({});
+      cookies = allCookies.filter(cookie => {
+        const domain = String(cookie.domain || '').replace(/^\./, '');
+        return domain === hostname || hostname.endsWith(`.${domain}`);
+      });
+    } catch {}
+  }
   const accountCookie = cookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ');
   let accountToken = '';
+  let accountUserId = '';
+  for (const cookie of cookies) {
+    const token = tokenFromValue(cookie.value, cookie.name);
+    if (token) { accountToken = token; break; }
+  }
   try {
-    accountToken = await loginWindow.webContents.executeJavaScript(`(() => {
-      const values = [];
+    const storageEntries = await loginWindow.webContents.executeJavaScript(`(() => {
+      const entries = [];
       for (const storage of [localStorage, sessionStorage]) {
         for (let i = 0; i < storage.length; i += 1) {
           const key = storage.key(i) || '';
           const value = storage.getItem(key) || '';
-          if (/token|jwt|access/i.test(key) || /^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$/.test(value)) values.push(value);
+          entries.push({ key, value });
         }
       }
-      for (const value of values) {
-        if (/^[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+$/.test(value)) return value;
-        try { const parsed = JSON.parse(value); const nested = parsed?.access_token || parsed?.token || parsed?.accessToken; if (nested) return nested; } catch {}
-        if (value && values.includes(value)) return value;
+      return entries;
+    })()`, true);
+    if (Array.isArray(storageEntries)) {
+      for (const entry of storageEntries) {
+        if (!accountUserId) accountUserId = accountUserIdFromValue(entry?.value, entry?.key || '');
+        const token = tokenFromValue(entry?.value, entry?.key || '');
+        if (token && !accountToken) accountToken = token;
       }
-      return '';
-    })()`);
+    }
   } catch {}
-  return { accountToken: String(accountToken || '').trim(), accountCookie };
+  return { accountToken: cleanSessionToken(accountToken), accountCookie, accountUserId: cleanAccountUserId(accountUserId) };
+}
+function accountAdapterCandidates(provider) {
+  const ids = [provider?.balanceAdapter, 'new-api', 'sub2api'];
+  const candidates = [];
+  for (const id of ids) {
+    if (!id || candidates.some(item => item.id === id)) continue;
+    const adapter = balanceAdapters[id];
+    if (adapter?.detect || adapter?.getBalance) candidates.push(adapter);
+  }
+  return candidates;
+}
+async function detectAccountAdapter(provider, credentials) {
+  const errors = [];
+  for (const adapter of accountAdapterCandidates(provider)) {
+    try {
+      const candidate = { ...provider, ...credentials };
+      const detection = typeof adapter.detect === 'function'
+        ? await adapter.detect(candidate)
+        : { profile: null };
+      const accountData = await adapter.getBalance({ ...candidate, _accountProfile: detection.profile });
+      return { adapter, accountData };
+    } catch (error) {
+      if (error?.rateLimited || Number(error?.status) === 429) throw error;
+      if (adapter.id === 'sub2api' && Number(error?.status) === 404) continue;
+      errors.push(`${adapter.label || adapter.id}: ${String(error?.message || error)}`);
+    }
+  }
+  throw new Error(errors.join('；') || '无法识别站点账户接口');
 }
 ipcMain.handle('connect-provider-account', async (_e, input) => {
   const isDraft = Boolean(input && typeof input === 'object' && input.provider);
@@ -439,39 +556,52 @@ ipcMain.handle('connect-provider-account', async (_e, input) => {
   const provider = isDraft ? normalizeProvider(input.provider) : state.providers.find(item => item.id === id);
   if (!provider) return { ok: false, error: 'Provider not found', state: safeState() };
   const adapter = getProviderAdapter(provider);
-  if (provider.balanceAdapter !== 'sub2api') return { ok: false, error: '当前 Adapter 不支持账户登录', state: safeState() };
+  if (!['sub2api', 'new-api'].includes(provider.balanceAdapter)) return { ok: false, error: '当前站点类型不支持账户登录', state: safeState() };
   const loginUrl = cleanBaseUrl(typeof input === 'object' ? input?.loginUrl : '') || provider.loginUrl;
   const origin = sub2apiOrigin({ ...provider, loginUrl });
   if (!origin) return { ok: false, error: '登录地址无效', state: safeState() };
   return new Promise(resolve => {
     let settled = false;
     let capturing = false;
+    let lastCaptureError = '';
+    const attemptedCredentials = new Set();
     const loginWindow = new BrowserWindow({ parent: mainWindow, modal: false, width: 1100, height: 760, title: `连接 ${provider.name} 账户`, webPreferences: { contextIsolation: true, nodeIntegration: false } });
     const finish = async (result) => { if (settled) return; settled = true; resolve(result); };
     const tryCapture = async () => {
       if (settled || capturing || loginWindow.isDestroyed()) return;
       const credentials = await readSub2apiCredentials(loginWindow, origin);
       if (settled || capturing || loginWindow.isDestroyed()) return;
-      if (!credentials.accountToken && !credentials.accountCookie) return;
+      const capturedUserId = credentials.accountUserId || provider.accountUserId || '';
+      if (!credentials.accountToken && !credentials.accountCookie && !capturedUserId) return;
+      const credentialFingerprint = `${credentials.accountToken}\n${credentials.accountCookie}\n${capturedUserId}`;
+      if (attemptedCredentials.has(credentialFingerprint)) return;
+      attemptedCredentials.add(credentialFingerprint);
       capturing = true;
-      const accountProvider = { ...provider, loginUrl, ...credentials };
+      const accountProvider = { ...provider, loginUrl, ...credentials, accountUserId: capturedUserId };
       let accountData;
+      let resolvedAdapter = adapter;
       try {
-        accountData = await adapter.getBalance(accountProvider);
-      } catch {
+        const detected = await detectAccountAdapter(accountProvider, { ...credentials, accountUserId: capturedUserId });
+        resolvedAdapter = detected.adapter;
+        accountData = detected.accountData;
+      } catch (error) {
+        lastCaptureError = String(error?.message || error || '账户接口验证失败');
+        loginWindow.setTitle(`连接 ${provider.name} 账户 - ${lastCaptureError.slice(0, 80)}`);
         capturing = false;
         return;
       }
+      provider.balanceAdapter = resolvedAdapter.id;
       provider.accountToken = credentials.accountToken || provider.accountToken || '';
       provider.accountCookie = credentials.accountCookie || provider.accountCookie || '';
+      provider.accountUserId = credentials.accountUserId || provider.accountUserId || '';
       const now = new Date().toISOString();
-      provider.accountStats = {
-        todayCost: Number(accountData.accountStats.todayCost),
-        todayRequests: Number(accountData.accountStats.todayRequests),
+      provider.accountStats = accountData.accountStats ? {
+        ...(accountData.accountStats.todayCost != null && Number.isFinite(Number(accountData.accountStats.todayCost)) ? { todayCost: Number(accountData.accountStats.todayCost) } : {}),
+        ...(accountData.accountStats.todayRequests != null && Number.isFinite(Number(accountData.accountStats.todayRequests)) ? { todayRequests: Number(accountData.accountStats.todayRequests) } : {}),
         ...(accountData.accountStats.todayTokens != null && Number.isFinite(Number(accountData.accountStats.todayTokens)) ? { todayTokens: Number(accountData.accountStats.todayTokens) } : {}),
         ...(accountData.accountStats.averageDurationMs != null && Number.isFinite(Number(accountData.accountStats.averageDurationMs)) ? { averageDurationMs: Number(accountData.accountStats.averageDurationMs) } : {}),
         updatedAt: now
-      };
+      } : provider.accountStats || null;
       provider.balance = {
         ...(provider.balance || {}),
         balance: Number(accountData.balance),
@@ -486,14 +616,14 @@ ipcMain.handle('connect-provider-account', async (_e, input) => {
       provider.balanceStatus = provider.balance.status;
       provider.balanceError = '';
       if (!isDraft) persist();
-      const snapshot = { accountToken: provider.accountToken, accountCookie: provider.accountCookie, accountStats: provider.accountStats, balance: provider.balance };
+      const snapshot = { accountToken: provider.accountToken, accountCookie: provider.accountCookie, accountUserId: provider.accountUserId, accountStats: provider.accountStats, balance: provider.balance, balanceAdapter: provider.balanceAdapter };
       await finish({ ok: true, state: safeState(), ...(isDraft ? { provider: snapshot } : {}) });
       if (!loginWindow.isDestroyed()) loginWindow.close();
     };
     const poll = setInterval(() => tryCapture().catch(() => {}), 1200);
     loginWindow.webContents.on('did-finish-load', () => setTimeout(() => tryCapture().catch(() => {}), 700));
-    loginWindow.on('closed', () => { clearInterval(poll); finish({ ok: false, error: '登录窗口已关闭，尚未获取到账户会话', state: safeState() }); });
-    loginWindow.loadURL(`${origin}/login`);
+    loginWindow.on('closed', () => { clearInterval(poll); finish({ ok: false, error: lastCaptureError || '登录窗口已关闭，尚未获取到账户会话', state: safeState() }); });
+    loginWindow.loadURL(loginUrl || `${origin}/login`);
   });
 });
 function makeWindow() {
@@ -677,7 +807,7 @@ ipcMain.handle('import-provider-tokens', async (_e, id) => {
   const input = id && typeof id === 'object' ? id : null;
   const provider = input?.provider ? normalizeProvider(input.provider) : state.providers.find(item => item.id === String(id || ''));
   if (!provider) return { ok: false, error: 'Provider not found' };
-  if (provider.balanceAdapter !== 'sub2api') return { ok: false, error: '令牌导入目前支持 Sub2API' };
+  if (provider.balanceAdapter !== 'sub2api') return { ok: false, error: '令牌导入目前支持 Sub2API；New API 请使用连接账户或备用登录令牌' };
   try {
     const tokens = await getProviderAdapter(provider).getApiKeys(provider);
     return { ok: true, tokens };
@@ -694,8 +824,8 @@ ipcMain.handle('save-provider', (_e, input) => {
   const requestUrl = Object.prototype.hasOwnProperty.call(input, 'requestUrl') ? cleanBaseUrl(input.requestUrl) : (existing?.requestUrl || '');
   const tokenRemark = Object.prototype.hasOwnProperty.call(input, 'tokenRemark') ? String(input.tokenRemark || '').trim() : (existing?.tokenRemark || '');
   const apiKeys = Array.isArray(input.apiKeys) ? input.apiKeys : [{ key: String(input.apiKey || '').trim() || existing?.apiKey || '', remark: tokenRemark, enabled: true }];
-  const selectedAdapter = input.balanceAdapter === 'neko-api' ? 'sub2api' : (input.balanceAdapter || 'custom');
-  const record = normalizeProvider({ id: input.id || crypto.randomUUID(), name: String(input.name || '未命名 Provider').trim(), loginUrl: cleanBaseUrl(input.loginUrl) || existing?.loginUrl || existing?.baseUrl || '', requestUrl, apiKeys, apiKey: String(input.apiKey || '').trim() || existing?.apiKey || '', tokenRemark, accountToken: String(input.accountToken || '').trim() || existing?.accountToken || '', accountCookie: String(input.accountCookie || '').trim() || existing?.accountCookie || '', accountStats: input.accountStats || (existing?.balanceAdapter === selectedAdapter ? existing?.accountStats || null : null), balance: input.balance || null, models: [], status: 'unknown', error: '', balanceAdapter: selectedAdapter, balanceUrl: input.balanceUrl, balanceMethod: input.balanceMethod, balancePath: input.balancePath, remainingPath: input.remainingPath, currency: input.currency, dailyStats: existing?.dailyStats });
+  const selectedAdapter = input.balanceAdapter === 'neko-api' ? 'sub2api' : (input.balanceAdapter || 'sub2api');
+  const record = normalizeProvider({ id: input.id || crypto.randomUUID(), name: String(input.name || '未命名 Provider').trim(), loginUrl: cleanBaseUrl(input.loginUrl) || existing?.loginUrl || existing?.baseUrl || '', requestUrl, apiKeys, apiKey: String(input.apiKey || '').trim() || existing?.apiKey || '', tokenRemark, accountToken: String(input.accountToken || '').trim() || existing?.accountToken || '', accountCookie: String(input.accountCookie || '').trim() || existing?.accountCookie || '', accountUserId: String(input.accountUserId || '').trim() || existing?.accountUserId || '', accountStats: input.accountStats || (existing?.balanceAdapter === selectedAdapter ? existing?.accountStats || null : null), balance: input.balance || null, models: [], status: 'unknown', error: '', balanceAdapter: selectedAdapter, balanceUrl: input.balanceUrl, balanceMethod: input.balanceMethod, balancePath: input.balancePath, remainingPath: input.remainingPath, currency: input.currency, dailyStats: existing?.dailyStats });
   const idx = state.providers.findIndex(p => p.id === record.id);
   if (idx >= 0) {
     record.models = state.providers[idx].models || [];

@@ -2,7 +2,7 @@
 
 一个 Windows 桌宠形式的本地 AI API 聚合网关第一版。
 
-当前版本：`0.1.85`
+当前版本：`0.1.91`
 
 版本规则：每次项目修改递增一个补丁版本号，例如 `0.1.2`、`0.1.3`。
 
@@ -37,7 +37,7 @@ npm start
 - 统一模型模式还可以选择上游格式：`chat/completions` 或 `responses`。客户端请求的端点必须与选择一致：分别使用 `/v1/chat/completions` 或 `/v1/responses`。
 - 统一模型格式默认是 `responses`；已有配置中明确选择过 `chat/completions` 的会保留原选择。
 - Provider 卡片支持余额、剩余额度、余额状态、查询时间和余额 API 状态。默认每 10 分钟自动刷新，也可以手动点击“立即刷新”，并在界面设置低余额阈值和刷新周期。
-- 正在连接 Sub2API 账户时，桌宠播放“工作”动画；查询余额时播放“吃饭”动画，操作结束后恢复正常动画。
+- 正在连接 Sub2API 或 New API 账户时，桌宠播放“工作”动画；查询余额时播放“吃饭”动画，操作结束后恢复正常动画。
 - 每次连接或余额刷新只播放一遍对应动画，避免连续查询重复加载 GIF 造成卡顿。
 - 工作和吃饭动画使用经过缩小和压缩的 WebP 资源播放，原始 GIF 仍保留在资源目录中。
 - 正常、工作和吃饭三种宠物动画都使用优化后的 WebP 资源；对话气泡中的“调用目标”菜单可以按站点或模型选择请求目标。
@@ -60,11 +60,16 @@ npm start
 - 站点编辑的内容只有点击“保存并测试”才会保存；关闭窗口、“取消”或按 Enter 均不会保存或测试。
 - Provider 卡片还会统计当天请求次数、成功率、最近响应时间和可从上游响应中读取的今日消耗额度；无法获取费用字段时显示 Token 数或 `--`。
 - Sub2API Adapter 支持连接账户并同步余额、今日实际消费和今日请求数；连接后会在站点信息中显示这三项账户数据。
-- AI Provider 标题栏提供“一键刷新账户”，按顺序连接所有 Sub2API 站点并自动关闭成功的登录窗口。
-- 添加或编辑 Sub2API Provider 时，都可在登录地址旁连接账户；新增站点的账户结果会暂存在当前编辑窗口，只有点击“保存并测试”才会保存。
+- AI Provider 标题栏提供“一键刷新账户”，按顺序连接所有 Sub2API 和 New API 站点并自动关闭成功的登录窗口。
+- 添加或编辑 Sub2API、New API Provider 时，都可在登录地址旁连接账户；新增站点的账户结果会暂存在当前编辑窗口，只有点击“保存并测试”才会保存。
+- Provider 编辑窗口中的“连接账户”和“导入令牌”按钮始终显示；不支持账户操作的站点类型点击后会提示当前站点类型暂不支持。
+- 余额 Adapter 字段已改名为“站点类型”。
+- 添加 Provider 时“站点类型”默认选择 Sub2API，选项顺序为 Sub2API、其他类型、自定义。
+- 添加或编辑 Provider 时的提示消息显示在弹窗标题下方，不会被 Provider 编辑弹窗遮挡。
 - Provider 地址分为“登录地址”和“请求地址”。登录地址用于账户登录和余额查询；请求地址用于 `/models` 与模型转发。请求地址留空时，程序自动使用登录地址。
 - 控制面板按“余额优先”排列：先显示 AI Provider 与余额信息，再显示本地统一 API，最后显示模型路由设置。
-- 余额查询使用 Provider Adapter。Sub2API 选择对应 Adapter 后，在 Provider 卡片点击“连接账户”，API Pet 会打开 Sub2API 登录窗口；登录完成后自动保存会话信息，并调用 `/api/v1/user/profile` 读取余额、`/api/v1/usage/dashboard/stats` 读取今日实际消费和今日请求数。以后按设置的刷新周期自动更新，也可以点击“刷新余额”。不需要手动打开网页查看余额。若登录窗口无法读取会话，也可以在编辑窗口填入备用 Bearer 登录令牌。New API、One API、Veloera 暂不猜测余额接口；请在 Provider 编辑窗口提供实际余额 URL、请求方法和响应字段路径。自定义 Adapter 默认读取 `data.balance`，可选配置 `data.remaining`。
+- 余额查询使用独立的 Provider Adapter。Sub2API 连接账户后调用 `/api/v1/user/profile` 和 `/api/v1/usage/dashboard/stats`；New API 连接账户后调用 `/api/user/self` 读取余额，并兼容读取 `/api/performance/stats`、`/api/performance/logs` 的今日统计。New API 网页的 `localStorage.uid` 会保存为用户 ID，并随请求发送 `New-Api-User`；也可以在编辑窗口手动填写。登录完成后会自动保存会话信息，之后按设置的刷新周期自动更新，也可以点击“刷新余额”。如果网页会话无法读取，也可以在编辑窗口填入备用 Bearer 登录令牌。One API、Veloera 暂不猜测余额接口；请在 Provider 编辑窗口提供实际余额 URL、请求方法和响应字段路径。自定义 Adapter 默认读取 `data.balance`，可选配置 `data.remaining`。
+- 连接账户会先用轻量账户接口识别站点类型，再调用对应 Adapter 获取余额和统计；相同 Cookie/Token 失败后不会重复轮询，遇到 `429 Too Many Requests` 会立即停止继续探测。
 
 Coding Agent 配置示例：Base URL 使用 `http://127.0.0.1:8787/v1`，API Key 使用控制面板中的统一 Key。统一模型模式下，模型填写 `Pet model`；模型路由模式下，模型填写真实模型名。
 

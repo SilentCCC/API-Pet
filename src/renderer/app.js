@@ -10,6 +10,7 @@ let balanceAnimationHoldUntil = 0;
 let connectionAnimationPlayed = false;
 let balanceAnimationPlayed = false;
 let animationTimer;
+let toastTimer;
 let currentPetAnimation = 'pet-normal.webp';
 const PET_ANIMATION_DURATION = 5160;
 const petImage = document.querySelector('.pet-image');
@@ -21,6 +22,12 @@ let chatFetchedProviderId = '';
 let chatFetchedKeyIndex = -1;
 let chatModelFetchToken = 0;
 let chatModelsLoading = false;
+let chatImages = [];
+let chatImagesLoading = 0;
+let chatSending = false;
+let chatImageQueue = Promise.resolve();
+const CHAT_IMAGE_LIMIT = 4;
+const CHAT_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
 let providersCollapsed = localStorage.getItem('api-pet-providers-collapsed') === 'true';
 let collapsedProviderIds = new Set(JSON.parse(localStorage.getItem('api-pet-collapsed-provider-ids') || '[]'));
 let expandedProviderIds = new Set(JSON.parse(localStorage.getItem('api-pet-expanded-provider-ids') || '[]'));
@@ -30,6 +37,61 @@ const panel = $('panel');
 const chatPanel = $('chatPanel');
 const dialog = $('providerDialog');
 const appRoot = document.querySelector('.app');
+let panelHeight = 430;
+function setupPanelHeightResize() {
+  window.apiPet.onPanelHeight(height => {
+    panelHeight = height;
+    appRoot.style.setProperty('--panel-height', `${height}px`);
+  });
+  [panel, chatPanel].forEach(surface => {
+    const handle = document.createElement('div');
+    handle.className = 'panel-height-handle';
+    handle.title = '调节窗口高度';
+    let drag = null;
+    let pendingHeight = null;
+    let sending = false;
+    async function flushResize() {
+      if (sending) return;
+      sending = true;
+      try {
+        while (pendingHeight != null) {
+          const height = pendingHeight;
+          pendingHeight = null;
+          await window.apiPet.resizePanelHeight(height);
+        }
+      } catch (error) {
+        pendingHeight = null;
+        toast(`调整高度失败：${error?.message || error}`);
+      } finally { sending = false; }
+    }
+    handle.onpointerdown = event => {
+      if (event.button !== 0) return;
+      event.preventDefault();
+      drag = { pointerId: event.pointerId, y: event.screenY, height: panelHeight };
+      handle.setPointerCapture(event.pointerId);
+      handle.classList.add('resizing');
+      appRoot.classList.add('resizing-panel');
+    };
+    handle.onpointermove = event => {
+      if (!drag || event.pointerId !== drag.pointerId) return;
+      pendingHeight = drag.height + drag.y - event.screenY;
+      flushResize();
+    };
+    const finish = () => {
+      drag = null;
+      handle.classList.remove('resizing');
+      appRoot.classList.remove('resizing-panel');
+    };
+    handle.onpointerup = event => {
+      if (!drag || event.pointerId !== drag.pointerId) return;
+      handle.releasePointerCapture(event.pointerId);
+      finish();
+    };
+    handle.onpointercancel = finish;
+    handle.onlostpointercapture = finish;
+    surface.prepend(handle);
+  });
+}
 
 function updatePetAnimation() {
   if (!petImage) return;
@@ -124,9 +186,12 @@ async function setChatVisible(visible) {
 function toast(message) {
   const el = dialog?.open ? $('dialogToast') : $('toast');
   if (!el) return;
+  clearTimeout(toastTimer);
   el.textContent = message;
   el.classList.add('show');
-  setTimeout(() => el.classList.remove('show'), 2400);
+  const text = String(message || '');
+  const isError = /失败|错误|异常|unauthorized|not found|invalid|timeout|超时/i.test(text);
+  toastTimer = setTimeout(() => el.classList.remove('show'), isError ? 12000 : 5000);
 }
 function escapeHtml(value) {
   return String(value ?? '').replace(/[&<>"']/g, char => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[char]));
@@ -211,7 +276,7 @@ function render() {
   $('toggleProviders').setAttribute('aria-expanded', String(!allProvidersCollapsed));
   const list = $('providers');
   list.innerHTML = '';
-  appState.providers.forEach(provider => {
+  appState.providers.forEach((provider, index) => {
     const card = document.createElement('div');
     card.className = 'provider-card';
     const balance = provider.balance || {};
@@ -237,7 +302,8 @@ function render() {
     : collapsedProviderIds.has(provider.id);
   if (compact) {
     card.classList.add('provider-card-compact');
-    card.innerHTML = `<div class="provider-compact-name">${escapeHtml(provider.name)}</div><b class="provider-compact-consumption">${consumption}</b><b class="provider-compact-balance">${amount}</b><button class="provider-toggle compact-toggle" type="button" aria-label="展开 ${escapeHtml(provider.name)}">⌄</button>`;
+    const reorder = providersCollapsed ? `<div class="provider-reorder-actions">${index > 0 ? '<button class="provider-reorder" data-direction="up" type="button" aria-label="上移站点" title="上移站点">↑</button>' : '<span></span>'}${index < appState.providers.length - 1 ? '<button class="provider-reorder" data-direction="down" type="button" aria-label="下移站点" title="下移站点">↓</button>' : '<span></span>'}</div>` : '';
+    card.innerHTML = `<div class="provider-compact-name">${escapeHtml(provider.name)}</div><b class="provider-compact-consumption">${consumption}</b><b class="provider-compact-balance">${amount}</b><div class="provider-compact-actions">${reorder}<button class="provider-toggle compact-toggle" type="button" aria-label="展开 ${escapeHtml(provider.name)}">⌄</button></div>`;
   } else {
     card.innerHTML = `<div class="provider-top"><div><div class="provider-name">${escapeHtml(provider.name)}</div><div class="provider-url">请求：${escapeHtml(displayUrl)}${provider.loginUrl && provider.loginUrl !== displayUrl ? `<br>登录：${escapeHtml(provider.loginUrl)}` : ''}</div></div><div class="provider-top-actions"><span class="badge ${provider.status}">${statusLabel(provider)} · ${provider.models?.length || 0} 个模型</span><button class="provider-toggle" type="button" aria-label="折叠 ${escapeHtml(provider.name)}">⌃</button></div></div><div class="balance-line"><b>${amount}</b><span>${balanceLabel(provider)}</span></div><div class="balance-meta">剩余额度：${remaining}　查询：${escapeHtml(checked)}<br>余额接口：${balanceConnection}</div><div class="provider-stats"><span>今日 Token：${todayTokens}</span><span>今日请求：${requests} 次</span><span>平均响应：${averageResponse}</span><span>今日消耗：${consumption}</span></div>${balance.error ? `<div class="balance-error">${escapeHtml(balance.error)}</div>` : ''}${provider.error ? `<div class="balance-error">${escapeHtml(provider.error)}</div>` : ''}<div class="provider-actions">${connectButton}<button class="test">测试连接</button><button class="refresh-balance">刷新余额</button><button class="edit">编辑</button><button class="delete">删除</button></div>`;
   }
@@ -254,6 +320,19 @@ function render() {
       localStorage.setItem('api-pet-collapsed-provider-ids', JSON.stringify([...collapsedProviderIds]));
     }
     render();
+  });
+  card.querySelectorAll('.provider-reorder').forEach(button => {
+    button.addEventListener('click', async () => {
+      if (button.disabled) return;
+      list.querySelectorAll('.provider-reorder').forEach(item => { item.disabled = true; });
+      try {
+        appState = await window.apiPet.moveProvider({ id: provider.id, direction: button.dataset.direction });
+        render();
+      } catch (error) {
+        list.querySelectorAll('.provider-reorder').forEach(item => { item.disabled = false; });
+        toast(`调整顺序失败：${error?.message || error}`);
+      }
+    });
   });
   card.querySelector('.test')?.addEventListener('click', () => testProvider(provider.id));
     card.querySelector('.connect-account')?.addEventListener('click', () => connectProviderAccount(provider.id));
@@ -359,6 +438,11 @@ async function importProviderTokens() {
   try {
     const result = await window.apiPet.importProviderTokens(editingId || { provider: collectProviderDraft() });
     if (!result.ok) { toast(result.error || '导入令牌失败'); return; }
+    if (result.credentials) {
+      draftAccountData = { ...draftAccountData, ...result.credentials };
+      $('accountToken').value = result.credentials.accountToken || '';
+      $('accountUserId').value = result.credentials.accountUserId || '';
+    }
     const selectedKey = providerTokenRows.find(row => row.enabled)?.key || '';
     const selectedIndex = result.tokens.findIndex(token => token.key === selectedKey);
     providerTokenRows = result.tokens.map((token, index) => ({ key: token.key, remark: token.name, enabled: index === (selectedIndex >= 0 ? selectedIndex : 0) }));
@@ -378,8 +462,10 @@ function collectProviderDraft() {
     requestUrl: $('requestUrl').value.trim(),
     balanceAdapter: $('balanceAdapter').value || 'sub2api',
     accountToken: $('accountToken').value.trim(),
+    accountRefreshToken: draftAccountData?.accountRefreshToken || '',
     accountUserId: $('accountUserId').value.trim(),
     accountCookie: draftAccountData?.accountCookie || '',
+    accountSession: draftAccountData?.accountSession || '',
     currency: $('currency').value
   };
 }
@@ -390,7 +476,7 @@ async function saveProviderAndTest() {
   if (!form.reportValidity()) return;
   const apiKeys = providerTokenRows.map(row => ({ key: String(row.key || '').trim(), remark: String(row.remark || '').trim(), enabled: row.enabled !== false })).filter(row => row.key);
   if (!apiKeys.some(row => row.enabled)) { toast('请至少勾选一个有效 API Key'); return; }
-  appState = await window.apiPet.saveProvider({ id: editingId, name: $('providerName').value, loginUrl: $('loginUrl').value, requestUrl: $('requestUrl').value, apiKeys, apiKey: apiKeys.find(row => row.enabled)?.key || apiKeys[0]?.key || '', tokenRemark: apiKeys.find(row => row.enabled)?.remark || '', accountToken: $('accountToken').value, accountCookie: draftAccountData?.accountCookie || '', accountUserId: $('accountUserId').value, accountStats: draftAccountData?.accountStats || null, balance: draftAccountData?.balance || null, balanceAdapter: $('balanceAdapter').value, balanceUrl: $('balanceUrl').value, balanceMethod: $('balanceMethod').value, balancePath: $('balancePath').value, remainingPath: $('remainingPath').value, currency: $('currency').value });
+  appState = await window.apiPet.saveProvider({ id: editingId, name: $('providerName').value, loginUrl: $('loginUrl').value, requestUrl: $('requestUrl').value, apiKeys, apiKey: apiKeys.find(row => row.enabled)?.key || apiKeys[0]?.key || '', tokenRemark: apiKeys.find(row => row.enabled)?.remark || '', accountToken: $('accountToken').value, accountRefreshToken: draftAccountData?.accountRefreshToken || '', accountCookie: draftAccountData?.accountCookie || '', accountSession: draftAccountData?.accountSession || '', accountUserId: $('accountUserId').value, accountStats: draftAccountData?.accountStats || null, balance: draftAccountData?.balance || null, balanceAdapter: $('balanceAdapter').value, balanceUrl: $('balanceUrl').value, balanceMethod: $('balanceMethod').value, balancePath: $('balancePath').value, remainingPath: $('remainingPath').value, currency: $('currency').value });
   dialog.close();
   render();
   const provider = appState.providers.find(item => item.id === editingId) || appState.providers.at(-1);
@@ -627,12 +713,23 @@ function updateChatModelLabel() {
   const targetLabel = site ? `${site.name} · ${model}` : model;
   $('chatModelLabel').textContent = enabled && model ? `${targetLabel} · /v1/${format}` : '请先选择可用模型';
 }
-function appendChatMessage(role, text) {
+function appendChatMessage(role, text, images = []) {
   const list = $('chatMessages');
   list.querySelector('.chat-empty')?.remove();
   const message = document.createElement('div');
   message.className = `chat-message ${role}`;
   message.textContent = text;
+  if (images.length) {
+    const gallery = document.createElement('div');
+    gallery.className = 'chat-message-images';
+    images.forEach(image => {
+      const preview = document.createElement('img');
+      preview.src = image.url;
+      preview.alt = image.name;
+      gallery.appendChild(preview);
+    });
+    message.appendChild(gallery);
+  }
   list.appendChild(message);
   list.scrollTop = list.scrollHeight;
   return message;
@@ -657,7 +754,13 @@ async function sendChatMessage(text) {
     apiKeyIndex: currentChatKeyIndex(),
     targetModel: model === 'Pet model' && chatFetchedModels.length ? chatFetchedModels[0] : '',
     messages: chatHistory.map(item => ({ role: item.role, content: item.content })),
-    input: chatHistory.map(item => `${item.role === 'user' ? '用户' : '助手'}：${item.content}`).join('\n')
+    input: chatHistory.some(item => Array.isArray(item.content))
+      ? chatHistory.map(item => ({ role: item.role, content: Array.isArray(item.content)
+        ? item.content.map(part => part.type === 'image_url'
+          ? { type: 'input_image', image_url: part.image_url.url }
+          : { type: 'input_text', text: part.text })
+        : [{ type: 'input_text', text: item.content }] }))
+      : chatHistory.map(item => `${item.role === 'user' ? '用户' : '助手'}：${item.content}`).join('\n')
   };
   const result = await window.apiPet.chatRequest(request);
   if (!result?.ok) throw new Error(result?.error || '直连请求失败');
@@ -666,16 +769,124 @@ async function sendChatMessage(text) {
   if (!answer) throw new Error('模型返回了空内容');
   return answer;
 }
+function updateChatMode() {
+  const imageMode = $('chatMode').value === 'image';
+  $('chatInput').placeholder = imageMode ? '描述你想生成的图片…' : '输入你的消息…';
+  $('sendChat').disabled = imageMode || chatSending || chatImagesLoading > 0;
+  $('chatMode').disabled = chatSending;
+  $('addChatImage').disabled = chatSending;
+  $('chatInput').required = chatImages.length === 0;
+  if (imageMode) $('sendChat').title = '绘图尚未接入';
+  else $('sendChat').removeAttribute('title');
+}
+function renderChatAttachments() {
+  const tray = $('chatAttachments');
+  tray.replaceChildren();
+  tray.classList.toggle('hidden', !chatImages.length);
+  chatImages.forEach(image => {
+    const item = document.createElement('div');
+    item.className = 'chat-attachment';
+    const preview = document.createElement('img');
+    preview.src = image.url;
+    preview.alt = image.name;
+    preview.title = image.name;
+    const remove = document.createElement('button');
+    remove.className = 'chat-image-remove';
+    remove.type = 'button';
+    remove.textContent = '×';
+    remove.title = `移除 ${image.name}`;
+    remove.setAttribute('aria-label', remove.title);
+    remove.disabled = chatSending;
+    remove.onclick = () => {
+      chatImages = chatImages.filter(item => item !== image);
+      renderChatAttachments();
+    };
+    item.append(preview, remove);
+    tray.appendChild(item);
+  });
+  updateChatMode();
+}
+function readChatImage(file) {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error('读取失败'));
+    reader.onload = () => {
+      const image = new Image();
+      image.onload = () => resolve({ name: file.name, url: reader.result });
+      image.onerror = () => reject(new Error('图片无法解码'));
+      image.src = reader.result;
+    };
+    reader.readAsDataURL(file);
+  });
+}
+function addChatImages(files) {
+  if (chatSending || !files.length) return;
+  const selected = Array.from(files);
+  chatImagesLoading += 1;
+  updateChatMode();
+  chatImageQueue = chatImageQueue.then(async () => {
+    const errors = [];
+    for (const file of selected) {
+      if (!['image/png', 'image/jpeg', 'image/webp', 'image/gif'].includes(file.type)) {
+        errors.push(`${file.name}：请选择 PNG、JPEG、WebP 或 GIF 图片`);
+        continue;
+      }
+      if (file.size > CHAT_IMAGE_MAX_BYTES) {
+        errors.push(`${file.name}：单张图片不能超过 10 MB`);
+        continue;
+      }
+      if (chatImages.length >= CHAT_IMAGE_LIMIT) {
+        errors.push('每条消息最多上传 4 张图片');
+        break;
+      }
+      try { chatImages.push(await readChatImage(file)); }
+      catch (error) { errors.push(`${file.name}：${error.message}`); }
+    }
+    if (errors.length) toast(errors.join('\n'));
+  }).finally(() => {
+    chatImagesLoading -= 1;
+    renderChatAttachments();
+  });
+  return chatImageQueue;
+}
+function setupChatImageUpload() {
+  $('addChatImage').onclick = () => $('chatImageFiles').click();
+  $('chatImageFiles').onchange = event => {
+    addChatImages(event.target.files);
+    event.target.value = '';
+  };
+  chatPanel.addEventListener('dragover', event => {
+    if (!Array.from(event.dataTransfer?.types || []).includes('Files')) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = chatSending ? 'none' : 'copy';
+    if (!chatSending) chatPanel.classList.add('drag-over');
+  });
+  chatPanel.addEventListener('dragleave', event => {
+    if (!chatPanel.contains(event.relatedTarget)) chatPanel.classList.remove('drag-over');
+  });
+  chatPanel.addEventListener('drop', event => {
+    event.preventDefault();
+    chatPanel.classList.remove('drag-over');
+    addChatImages(event.dataTransfer?.files || []);
+  });
+}
 async function handleChatSubmit(event) {
   event.preventDefault();
   const input = $('chatInput');
   const sendButton = $('sendChat');
   const text = input.value.trim();
-  if (!text || sendButton.disabled) return;
+  if ((!text && !chatImages.length) || sendButton.disabled || $('chatMode').value !== 'text') return;
+  const images = chatImages;
+  chatImages = [];
+  chatSending = true;
+  renderChatAttachments();
   input.value = '';
-  appendChatMessage('user', text);
-  chatHistory.push({ role: 'user', content: text });
+  appendChatMessage('user', text, images);
+  chatHistory.push({ role: 'user', content: images.length
+    ? [...(text ? [{ type: 'text', text }] : []), ...images.map(image => ({ type: 'image_url', image_url: { url: image.url } }))]
+    : text });
   sendButton.disabled = true;
+  $('chatMode').disabled = true;
   sendButton.textContent = '请求中…';
   const pending = appendChatMessage('assistant pending', '正在思考…');
   try {
@@ -687,8 +898,11 @@ async function handleChatSubmit(event) {
     pending.className = 'chat-message error';
     pending.textContent = error.message || '请求失败';
     chatHistory.pop();
+    input.value = [text, input.value].filter(Boolean).join('\n');
+    chatImages = images;
   } finally {
-    sendButton.disabled = false;
+    chatSending = false;
+    renderChatAttachments();
     sendButton.textContent = '发送';
     input.focus();
   }
@@ -705,6 +919,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   dialogToast.className = 'dialog-toast';
   dialog.querySelector('.dialog-head')?.after(dialogToast);
   ensureChatTargetMenu();
+  setupPanelHeightResize();
   window.apiPet.onBalanceActivity(setBalanceActivity);
   appState = await window.apiPet.getState();
   setBalanceActivity(await window.apiPet.getBalanceActivity());
@@ -715,6 +930,9 @@ window.addEventListener('DOMContentLoaded', async () => {
   $('openChat').onclick = () => setChatVisible(chatPanel.classList.contains('hidden'));
   $('openSettings').onclick = () => setPanelVisible(panel.classList.contains('hidden'));
   $('chatForm').onsubmit = handleChatSubmit;
+  $('chatMode').onchange = updateChatMode;
+  setupChatImageUpload();
+  updateChatMode();
   $('closeChat').onclick = () => setChatVisible(false);
   $('closePanel').onclick = () => setPanelVisible(false);
   $('addProvider').onclick = openAdd;

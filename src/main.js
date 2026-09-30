@@ -19,6 +19,10 @@ const PET_OPEN_TOP = 450;
 const PET_SIZE = { width: 155, height: 190 };
 const CLOSED_WINDOW_SIZE = { width: 190, height: 220 };
 const OPEN_WINDOW_SIZE = { width: 430, height: 650 };
+const DEFAULT_PANEL_HEIGHT = 430;
+const MIN_PANEL_HEIGHT = 320;
+let panelHeight = DEFAULT_PANEL_HEIGHT;
+function openPetTop() { return PET_OPEN_TOP + panelHeight - DEFAULT_PANEL_HEIGHT; }
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 
 process.on('uncaughtException', error => writeStartupLog('主进程未捕获异常', error));
@@ -86,13 +90,25 @@ function setPanelWindowPosition(open) {
   if (panelWindowOpen === open) return;
   const bounds = mainWindow.getBounds();
   const anchorX = bounds.x + PET_LEFT;
-  const anchorY = bounds.y + (panelWindowOpen ? PET_OPEN_TOP : PET_CLOSED_TOP);
-  const size = open ? OPEN_WINDOW_SIZE : CLOSED_WINDOW_SIZE;
-  const top = open ? PET_OPEN_TOP : PET_CLOSED_TOP;
+  const anchorY = bounds.y + (panelWindowOpen ? openPetTop() : PET_CLOSED_TOP);
+  const size = open ? { ...OPEN_WINDOW_SIZE, height: OPEN_WINDOW_SIZE.height + panelHeight - DEFAULT_PANEL_HEIGHT } : CLOSED_WINDOW_SIZE;
+  const top = open ? openPetTop() : PET_CLOSED_TOP;
   panelWindowOpen = open;
   // Resize and move together so the pet keeps the same screen anchor while the bubble grows upward.
   mainWindow.setBounds({ x: anchorX - PET_LEFT, y: anchorY - top, width: size.width, height: size.height }, false);
   clampWindowToDisplay();
+}
+function resizePanelHeight(height) {
+  if (!panelWindowOpen || !mainWindow || mainWindow.isDestroyed() || !Number.isFinite(height)) return panelHeight;
+  const bounds = mainWindow.getBounds();
+  const area = screen.getDisplayMatching(bounds).workArea;
+  const anchorY = bounds.y + openPetTop();
+  const maxHeight = Math.max(MIN_PANEL_HEIGHT, Math.min(area.height - 220, anchorY - area.y - 20));
+  panelHeight = Math.round(Math.min(Math.max(height, MIN_PANEL_HEIGHT), maxHeight));
+  mainWindow.webContents.send('panel-height', panelHeight);
+  mainWindow.setBounds({ x: bounds.x, y: anchorY - openPetTop(), width: OPEN_WINDOW_SIZE.width,
+    height: OPEN_WINDOW_SIZE.height + panelHeight - DEFAULT_PANEL_HEIGHT }, false);
+  return panelHeight;
 }
 
 function ensureMainWindowVisible() {
@@ -216,7 +232,7 @@ function clampWindowToDisplay() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
   const bounds = mainWindow.getBounds();
   const area = screen.getDisplayMatching(bounds).workArea;
-  const petTop = panelWindowOpen ? PET_OPEN_TOP : PET_CLOSED_TOP;
+  const petTop = panelWindowOpen ? openPetTop() : PET_CLOSED_TOP;
   const petX = Math.min(Math.max(bounds.x + PET_LEFT, area.x), area.x + area.width - PET_SIZE.width);
   const petY = Math.min(Math.max(bounds.y + petTop, area.y), area.y + area.height - PET_SIZE.height);
   const x = petX - PET_LEFT;
@@ -248,8 +264,10 @@ function normalizeProvider(provider) {
     apiKey: selectedKey.key,
     tokenRemark: selectedKey.remark,
     accountToken: provider.accountToken || '',
+    accountRefreshToken: provider.accountRefreshToken || '',
     accountCookie: provider.accountCookie || '',
     accountUserId: cleanAccountUserId(provider.accountUserId),
+    accountSession: cleanSessionToken(provider.accountSession),
     balanceUrl: provider.balanceUrl || '',
     balanceMethod: provider.balanceMethod || 'GET',
     balancePath: provider.balancePath || 'data.balance',
@@ -449,8 +467,20 @@ function accountUserIdFromValue(value, keyHint = '') {
   if (typeof value === 'object') return accountUserIdFromValue(value.uid ?? value.user_id ?? value.userId ?? value.id, 'uid');
   return '';
 }
+function sessionIdFromValue(value, seen = new Set()) {
+  if (!value || typeof value !== 'object' || seen.has(value)) return '';
+  seen.add(value);
+  if (value.session && typeof value.session === 'object' && value.session.sid) return cleanSessionToken(value.session.sid);
+  if (value.sid && typeof value.sid === 'string') return cleanSessionToken(value.sid);
+  for (const child of Object.values(value)) {
+    const found = sessionIdFromValue(child, seen);
+    if (found) return found;
+  }
+  return '';
+}
 function tokenFromValue(value, keyHint = '', seen = new Set()) {
   if (value == null) return '';
+  if (/refresh/i.test(keyHint)) return '';
   if (typeof value === 'string') {
     const text = value.trim();
     if (!text) return '';
@@ -481,22 +511,40 @@ function tokenFromValue(value, keyHint = '', seen = new Set()) {
   return '';
 }
 async function readSub2apiCredentials(loginWindow, origin) {
-  let cookies = [];
-  try { cookies = await loginWindow.webContents.session.cookies.get({ url: origin }); } catch {}
-  if (!cookies.length) {
+  const cookieByKey = new Map();
+  const collectCookies = async (url) => {
+    try {
+      const rows = await loginWindow.webContents.session.cookies.get({ url });
+      for (const cookie of rows) {
+        const key = `${cookie.name}|${cookie.domain}|${cookie.path}`;
+        cookieByKey.set(key, cookie);
+      }
+    } catch {}
+  };
+  await collectCookies(origin);
+  await collectCookies(`${origin}/api/user/auth/refresh`);
+  if (!cookieByKey.size) {
     try {
       const hostname = new URL(origin).hostname;
       const allCookies = await loginWindow.webContents.session.cookies.get({});
-      cookies = allCookies.filter(cookie => {
+      for (const cookie of allCookies) {
         const domain = String(cookie.domain || '').replace(/^\./, '');
-        return domain === hostname || hostname.endsWith(`.${domain}`);
-      });
+        if (domain === hostname || hostname.endsWith(`.${domain}`)) {
+          const key = `${cookie.name}|${cookie.domain}|${cookie.path}`;
+          cookieByKey.set(key, cookie);
+        }
+      }
     } catch {}
   }
-  const accountCookie = cookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ');
+  let cookies = [...cookieByKey.values()];
+  let accountCookie = cookies.map(cookie => `${cookie.name}=${cookie.value}`).join('; ');
   let accountToken = '';
+  let accountRefreshToken = '';
   let accountUserId = '';
+  let accountSession = '';
   for (const cookie of cookies) {
+    if (/session|refresh/i.test(cookie.name) && !isJwt(cookie.value)) continue;
+    if (cookie.name === 'new_api_has_session') continue;
     const token = tokenFromValue(cookie.value, cookie.name);
     if (token) { accountToken = token; break; }
   }
@@ -515,12 +563,63 @@ async function readSub2apiCredentials(loginWindow, origin) {
     if (Array.isArray(storageEntries)) {
       for (const entry of storageEntries) {
         if (!accountUserId) accountUserId = accountUserIdFromValue(entry?.value, entry?.key || '');
+        if (/^(refresh_token|refreshToken)$/i.test(entry?.key || '')) {
+          accountRefreshToken = cleanSessionToken(entry.value);
+          continue;
+        }
         const token = tokenFromValue(entry?.value, entry?.key || '');
-        if (token && !accountToken) accountToken = token;
+        if (token && (!accountToken || /^(auth_token|access_token|accessToken)$/i.test(entry?.key || ''))) accountToken = token;
       }
     }
   } catch {}
-  return { accountToken: cleanSessionToken(accountToken), accountCookie, accountUserId: cleanAccountUserId(accountUserId) };
+  // New API keeps the access token in an in-memory auth store and the session
+  // cookie is usually HttpOnly. Refresh once from the login page itself so the
+  // request has the exact same credentials as the site's own frontend.
+  if (cookies.some(cookie => cookie.name === 'new_api_refresh')) {
+    try {
+      const pageRefresh = await loginWindow.webContents.executeJavaScript(`(async () => {
+        if (location.origin !== ${JSON.stringify(origin)}) return null;
+        const refresh = async () => {
+        try {
+          const response = await fetch('/api/user/auth/refresh', {
+            method: 'POST',
+            credentials: 'include',
+            headers: { Accept: 'application/json', 'Cache-Control': 'no-cache, no-store' },
+            signal: AbortSignal.timeout(10000)
+          });
+          const text = await response.text();
+          let body = null;
+          try { body = JSON.parse(text); } catch {}
+          return { ok: response.ok, status: response.status, body };
+        } catch (error) {
+          return { ok: false, status: 0, body: null };
+        }
+        };
+        return navigator.locks
+          ? navigator.locks.request('new-api:auth-refresh', refresh)
+          : refresh();
+      })()`, true);
+      if (pageRefresh?.ok && pageRefresh.body?.success !== false) {
+        const bundle = pageRefresh.body?.data ?? pageRefresh.body;
+        accountToken = cleanSessionToken(bundle?.access_token || bundle?.accessToken) || accountToken;
+        accountSession = sessionIdFromValue(pageRefresh.body);
+        accountUserId = accountUserIdFromValue(bundle?.user, 'user') || accountUserId;
+        try {
+          const refreshedByKey = new Map();
+          for (const url of [origin, `${origin}/api/user/auth/refresh`]) {
+            try {
+              const refreshedCookies = await loginWindow.webContents.session.cookies.get({ url });
+              for (const cookie of refreshedCookies) {
+                refreshedByKey.set(`${cookie.name}|${cookie.domain}|${cookie.path}`, cookie);
+              }
+            } catch {}
+          }
+          if (refreshedByKey.size) accountCookie = [...refreshedByKey.values()].map(cookie => `${cookie.name}=${cookie.value}`).join('; ');
+        } catch {}
+      }
+    } catch {}
+  }
+  return { accountToken: cleanSessionToken(accountToken), accountRefreshToken, accountCookie, accountUserId: cleanAccountUserId(accountUserId), accountSession: cleanSessionToken(accountSession) };
 }
 function accountAdapterCandidates(provider) {
   const ids = [provider?.balanceAdapter, 'new-api', 'sub2api'];
@@ -540,8 +639,15 @@ async function detectAccountAdapter(provider, credentials) {
       const detection = typeof adapter.detect === 'function'
         ? await adapter.detect(candidate)
         : { profile: null };
-      const accountData = await adapter.getBalance({ ...candidate, _accountProfile: detection.profile });
-      return { adapter, accountData };
+      const balanceProvider = { ...candidate, _accountProfile: detection.profile };
+      const accountData = await adapter.getBalance(balanceProvider);
+      return { adapter, accountData, credentials: {
+        accountToken: balanceProvider.accountToken,
+        accountRefreshToken: balanceProvider.accountRefreshToken,
+        accountCookie: balanceProvider.accountCookie,
+        accountSession: balanceProvider.accountSession,
+        accountUserId: balanceProvider.accountUserId
+      } };
     } catch (error) {
       if (error?.rateLimited || Number(error?.status) === 429) throw error;
       if (adapter.id === 'sub2api' && Number(error?.status) === 404) continue;
@@ -569,56 +675,78 @@ ipcMain.handle('connect-provider-account', async (_e, input) => {
     const finish = async (result) => { if (settled) return; settled = true; resolve(result); };
     const tryCapture = async () => {
       if (settled || capturing || loginWindow.isDestroyed()) return;
-      const credentials = await readSub2apiCredentials(loginWindow, origin);
-      if (settled || capturing || loginWindow.isDestroyed()) return;
-      const capturedUserId = credentials.accountUserId || provider.accountUserId || '';
-      if (!credentials.accountToken && !credentials.accountCookie && !capturedUserId) return;
-      const credentialFingerprint = `${credentials.accountToken}\n${credentials.accountCookie}\n${capturedUserId}`;
-      if (attemptedCredentials.has(credentialFingerprint)) return;
-      attemptedCredentials.add(credentialFingerprint);
       capturing = true;
-      const accountProvider = { ...provider, loginUrl, ...credentials, accountUserId: capturedUserId };
-      let accountData;
-      let resolvedAdapter = adapter;
       try {
-        const detected = await detectAccountAdapter(accountProvider, { ...credentials, accountUserId: capturedUserId });
-        resolvedAdapter = detected.adapter;
-        accountData = detected.accountData;
-      } catch (error) {
-        lastCaptureError = String(error?.message || error || '账户接口验证失败');
-        loginWindow.setTitle(`连接 ${provider.name} 账户 - ${lastCaptureError.slice(0, 80)}`);
+        const credentials = await readSub2apiCredentials(loginWindow, origin);
+        if (settled || loginWindow.isDestroyed()) return;
+        const capturedUserId = credentials.accountUserId || provider.accountUserId || '';
+        if (!credentials.accountToken && !credentials.accountRefreshToken && !credentials.accountCookie && !capturedUserId) return;
+        const credentialFingerprint = `${credentials.accountToken}\n${credentials.accountRefreshToken}\n${credentials.accountCookie}\n${credentials.accountSession}\n${capturedUserId}`;
+        if (attemptedCredentials.has(credentialFingerprint)) return;
+        attemptedCredentials.add(credentialFingerprint);
+        const accountProvider = { ...provider, loginUrl, ...credentials, accountUserId: capturedUserId };
+        let accountData;
+        let resolvedAdapter = adapter;
+        try {
+          const detected = await detectAccountAdapter(accountProvider, { ...credentials, accountUserId: capturedUserId });
+          resolvedAdapter = detected.adapter;
+          accountData = detected.accountData;
+          Object.assign(accountProvider, detected.credentials);
+        } catch (error) {
+          lastCaptureError = String(error?.message || error || '账户接口验证失败');
+          if (!loginWindow.isDestroyed()) loginWindow.setTitle(`连接 ${provider.name} 账户 - ${lastCaptureError.slice(0, 80)}`);
+          return;
+        }
+        if (settled || loginWindow.isDestroyed()) return;
+        if (resolvedAdapter.id === 'sub2api' && accountProvider.accountRefreshToken
+          && accountProvider.accountRefreshToken !== credentials.accountRefreshToken) {
+          try {
+            const storageCredentials = { origin, token: accountProvider.accountToken, refreshToken: accountProvider.accountRefreshToken };
+            await loginWindow.webContents.executeJavaScript(`(() => {
+              const credentials = ${JSON.stringify(storageCredentials)};
+              if (location.origin !== credentials.origin) return;
+              localStorage.setItem('auth_token', credentials.token);
+              localStorage.setItem('refresh_token', credentials.refreshToken);
+            })()`, true);
+          } catch {}
+        }
+        provider.balanceAdapter = resolvedAdapter.id;
+        // New API access tokens are short-lived. The adapter may refresh one from
+        // the captured session cookie while validating the account, so prefer the
+        // refreshed value from accountProvider over the stale captured value.
+        provider.accountToken = accountProvider.accountToken || credentials.accountToken || provider.accountToken || '';
+        provider.accountRefreshToken = accountProvider.accountRefreshToken || '';
+        provider.accountCookie = accountProvider.accountCookie || '';
+        provider.accountUserId = accountProvider.accountUserId || '';
+        provider.accountSession = accountProvider.accountSession || '';
+        const now = new Date().toISOString();
+        provider.accountStats = accountData.accountStats ? {
+          ...(accountData.accountStats.todayCost != null && Number.isFinite(Number(accountData.accountStats.todayCost)) ? { todayCost: Number(accountData.accountStats.todayCost) } : {}),
+          ...(accountData.accountStats.todayRequests != null && Number.isFinite(Number(accountData.accountStats.todayRequests)) ? { todayRequests: Number(accountData.accountStats.todayRequests) } : {}),
+          ...(accountData.accountStats.todayTokens != null && Number.isFinite(Number(accountData.accountStats.todayTokens)) ? { todayTokens: Number(accountData.accountStats.todayTokens) } : {}),
+          ...(accountData.accountStats.averageDurationMs != null && Number.isFinite(Number(accountData.accountStats.averageDurationMs)) ? { averageDurationMs: Number(accountData.accountStats.averageDurationMs) } : {}),
+          updatedAt: now
+        } : provider.accountStats || null;
+        provider.balance = {
+          ...(provider.balance || {}),
+          balance: Number(accountData.balance),
+          remaining: accountData.remaining ?? null,
+          currency: accountData.currency || provider.currency || '$',
+          status: balanceStatus(accountData.balance, state.balanceSettings.lowThreshold),
+          apiStatus: 'online',
+          error: '',
+          updatedAt: now,
+          configured: true
+        };
+        provider.balanceStatus = provider.balance.status;
+        provider.balanceError = '';
+        if (!isDraft) persist();
+        const snapshot = { accountToken: provider.accountToken, accountRefreshToken: provider.accountRefreshToken, accountCookie: provider.accountCookie, accountUserId: provider.accountUserId, accountSession: provider.accountSession, accountStats: provider.accountStats, balance: provider.balance, balanceAdapter: provider.balanceAdapter };
+        await finish({ ok: true, state: safeState(), ...(isDraft ? { provider: snapshot } : {}) });
+        if (!loginWindow.isDestroyed()) loginWindow.close();
+      } finally {
         capturing = false;
-        return;
       }
-      provider.balanceAdapter = resolvedAdapter.id;
-      provider.accountToken = credentials.accountToken || provider.accountToken || '';
-      provider.accountCookie = credentials.accountCookie || provider.accountCookie || '';
-      provider.accountUserId = credentials.accountUserId || provider.accountUserId || '';
-      const now = new Date().toISOString();
-      provider.accountStats = accountData.accountStats ? {
-        ...(accountData.accountStats.todayCost != null && Number.isFinite(Number(accountData.accountStats.todayCost)) ? { todayCost: Number(accountData.accountStats.todayCost) } : {}),
-        ...(accountData.accountStats.todayRequests != null && Number.isFinite(Number(accountData.accountStats.todayRequests)) ? { todayRequests: Number(accountData.accountStats.todayRequests) } : {}),
-        ...(accountData.accountStats.todayTokens != null && Number.isFinite(Number(accountData.accountStats.todayTokens)) ? { todayTokens: Number(accountData.accountStats.todayTokens) } : {}),
-        ...(accountData.accountStats.averageDurationMs != null && Number.isFinite(Number(accountData.accountStats.averageDurationMs)) ? { averageDurationMs: Number(accountData.accountStats.averageDurationMs) } : {}),
-        updatedAt: now
-      } : provider.accountStats || null;
-      provider.balance = {
-        ...(provider.balance || {}),
-        balance: Number(accountData.balance),
-        remaining: accountData.remaining ?? null,
-        currency: accountData.currency || provider.currency || '$',
-        status: balanceStatus(accountData.balance, state.balanceSettings.lowThreshold),
-        apiStatus: 'online',
-        error: '',
-        updatedAt: now,
-        configured: true
-      };
-      provider.balanceStatus = provider.balance.status;
-      provider.balanceError = '';
-      if (!isDraft) persist();
-      const snapshot = { accountToken: provider.accountToken, accountCookie: provider.accountCookie, accountUserId: provider.accountUserId, accountStats: provider.accountStats, balance: provider.balance, balanceAdapter: provider.balanceAdapter };
-      await finish({ ok: true, state: safeState(), ...(isDraft ? { provider: snapshot } : {}) });
-      if (!loginWindow.isDestroyed()) loginWindow.close();
     };
     const poll = setInterval(() => tryCapture().catch(() => {}), 1200);
     loginWindow.webContents.on('did-finish-load', () => setTimeout(() => tryCapture().catch(() => {}), 700));
@@ -672,7 +800,7 @@ async function directChatRequest(input = {}) {
   const format = input.format === 'chat/completions' ? 'chat/completions' : 'responses';
   const upstreamBody = format === 'chat/completions'
     ? { model, messages: Array.isArray(input.messages) ? input.messages : [], stream: false }
-    : { model, input: String(input.input || ''), stream: false };
+    : { model, input: Array.isArray(input.input) ? input.input : String(input.input || ''), stream: false };
   const requestStartedAt = Date.now();
   recordProviderRequest(provider);
   persist();
@@ -807,12 +935,20 @@ ipcMain.handle('import-provider-tokens', async (_e, id) => {
   const input = id && typeof id === 'object' ? id : null;
   const provider = input?.provider ? normalizeProvider(input.provider) : state.providers.find(item => item.id === String(id || ''));
   if (!provider) return { ok: false, error: 'Provider not found' };
-  if (provider.balanceAdapter !== 'sub2api') return { ok: false, error: '令牌导入目前支持 Sub2API；New API 请使用连接账户或备用登录令牌' };
+  if (!['sub2api', 'new-api'].includes(provider.balanceAdapter)) return { ok: false, error: '当前站点类型暂不支持令牌导入' };
   try {
     const tokens = await getProviderAdapter(provider).getApiKeys(provider);
-    return { ok: true, tokens };
+    return { ok: true, tokens, credentials: {
+      accountToken: provider.accountToken,
+      accountRefreshToken: provider.accountRefreshToken,
+      accountCookie: provider.accountCookie,
+      accountSession: provider.accountSession,
+      accountUserId: provider.accountUserId
+    } };
   } catch (error) {
     return { ok: false, error: String(error?.message || error) };
+  } finally {
+    if (!input?.provider) persist();
   }
 });
 ipcMain.handle('chat-request', async (_e, input) => {
@@ -825,7 +961,8 @@ ipcMain.handle('save-provider', (_e, input) => {
   const tokenRemark = Object.prototype.hasOwnProperty.call(input, 'tokenRemark') ? String(input.tokenRemark || '').trim() : (existing?.tokenRemark || '');
   const apiKeys = Array.isArray(input.apiKeys) ? input.apiKeys : [{ key: String(input.apiKey || '').trim() || existing?.apiKey || '', remark: tokenRemark, enabled: true }];
   const selectedAdapter = input.balanceAdapter === 'neko-api' ? 'sub2api' : (input.balanceAdapter || 'sub2api');
-  const record = normalizeProvider({ id: input.id || crypto.randomUUID(), name: String(input.name || '未命名 Provider').trim(), loginUrl: cleanBaseUrl(input.loginUrl) || existing?.loginUrl || existing?.baseUrl || '', requestUrl, apiKeys, apiKey: String(input.apiKey || '').trim() || existing?.apiKey || '', tokenRemark, accountToken: String(input.accountToken || '').trim() || existing?.accountToken || '', accountCookie: String(input.accountCookie || '').trim() || existing?.accountCookie || '', accountUserId: String(input.accountUserId || '').trim() || existing?.accountUserId || '', accountStats: input.accountStats || (existing?.balanceAdapter === selectedAdapter ? existing?.accountStats || null : null), balance: input.balance || null, models: [], status: 'unknown', error: '', balanceAdapter: selectedAdapter, balanceUrl: input.balanceUrl, balanceMethod: input.balanceMethod, balancePath: input.balancePath, remainingPath: input.remainingPath, currency: input.currency, dailyStats: existing?.dailyStats });
+  const record = normalizeProvider({ id: input.id || crypto.randomUUID(), name: String(input.name || '未命名 Provider').trim(), loginUrl: cleanBaseUrl(input.loginUrl) || existing?.loginUrl || existing?.baseUrl || '', requestUrl, apiKeys, apiKey: String(input.apiKey || '').trim() || existing?.apiKey || '', tokenRemark, accountToken: String(input.accountToken || '').trim() || existing?.accountToken || '', accountCookie: String(input.accountCookie || '').trim() || existing?.accountCookie || '', accountSession: String(input.accountSession || '').trim() || existing?.accountSession || '', accountUserId: String(input.accountUserId || '').trim() || existing?.accountUserId || '', accountStats: input.accountStats || (existing?.balanceAdapter === selectedAdapter ? existing?.accountStats || null : null), balance: input.balance || null, models: [], status: 'unknown', error: '', balanceAdapter: selectedAdapter, balanceUrl: input.balanceUrl, balanceMethod: input.balanceMethod, balancePath: input.balancePath, remainingPath: input.remainingPath, currency: input.currency, dailyStats: existing?.dailyStats });
+  record.accountRefreshToken = cleanSessionToken(input.accountRefreshToken || existing?.accountRefreshToken);
   const idx = state.providers.findIndex(p => p.id === record.id);
   if (idx >= 0) {
     record.models = state.providers[idx].models || [];
@@ -836,6 +973,15 @@ ipcMain.handle('save-provider', (_e, input) => {
 });
 ipcMain.handle('delete-provider', (_e, id) => { state.providers = state.providers.filter(p => p.id !== id); Object.keys(state.routes).forEach(m => { if (state.routes[m] === id) delete state.routes[m]; }); if (state.unifiedRoute.providerId === id) state.unifiedRoute = { providerId: '', model: '', format: state.unifiedRoute.format || 'responses' }; persist(); return safeState(); });
 ipcMain.handle('test-provider', (_e, id) => testProvider(id));
+ipcMain.handle('move-provider', (_e, input) => {
+  const direction = input?.direction === 'up' ? -1 : input?.direction === 'down' ? 1 : 0;
+  const index = state.providers.findIndex(provider => provider.id === input?.id);
+  const target = index + direction;
+  if (!direction || index < 0 || target < 0 || target >= state.providers.length) return safeState();
+  [state.providers[index], state.providers[target]] = [state.providers[target], state.providers[index]];
+  persist();
+  return safeState();
+});
 ipcMain.handle('refresh-provider-balance', (_e, id) => queryProviderBalance(id));
 ipcMain.handle('refresh-all-balances', () => refreshAllBalances());
 ipcMain.handle('get-balance-activity', () => activeBalanceQueries > 0);
@@ -866,3 +1012,4 @@ ipcMain.handle('set-panel-open', (_e, open) => {
     true
   ).then(() => true).catch(() => false);
 });
+ipcMain.handle('resize-panel-height', (_e, height) => resizePanelHeight(height));

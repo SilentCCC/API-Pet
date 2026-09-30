@@ -26,11 +26,19 @@ function requestHeaders(provider) {
   const token = String(provider.accountToken || '').trim().replace(/^Bearer\s+/i, '');
   const cookie = String(provider.accountCookie || '').trim();
   const userId = String(provider.accountUserId || '').trim();
+  const session = String(provider.accountSession || '').trim();
   const headers = { Accept: 'application/json' };
-  if (token) headers.Authorization = `Bearer ${token}`;
+  // Older saved accounts may contain a session cookie in the token field.
+  const isSessionCookie = cookie.split(';').some(pair => {
+    const index = pair.indexOf('=');
+    return index >= 0 && /^(session|new_api_refresh)$/i.test(pair.slice(0, index).trim())
+      && pair.slice(index + 1).trim() === token;
+  });
+  if (token && !isSessionCookie) headers.Authorization = `Bearer ${token}`;
   if (cookie) headers.Cookie = cookie;
   if (userId) headers['New-Api-User'] = userId;
-  return { headers, token, cookie };
+  if (session) headers['X-Auth-Session'] = session;
+  return { headers, token, cookie, session };
 }
 
 function quotaAmount(value) {
@@ -90,8 +98,74 @@ function normalizeDuration(value) {
   return number > 0 && number < 100 ? number * 1000 : number;
 }
 
-async function getJson(url, headers, signal) {
-  const response = await fetch(url, { headers, signal });
+function updateCookieHeader(cookie, response) {
+  const cookies = new Map();
+  for (const pair of cookie.split(';')) {
+    const index = pair.indexOf('=');
+    if (index > 0) cookies.set(pair.slice(0, index).trim(), pair.slice(index + 1).trim());
+  }
+  // getSetCookie preserves separate headers, including commas in Expires.
+  for (const header of response.headers.getSetCookie()) {
+    const [pair, ...attributes] = header.split(';');
+    const index = pair.indexOf('=');
+    if (index <= 0) continue;
+    const name = pair.slice(0, index).trim();
+    const value = pair.slice(index + 1).trim();
+    const expired = attributes.some(attribute => {
+      const [key, ...parts] = attribute.trim().split('=');
+      if (key.toLowerCase() === 'max-age') return Number(parts.join('=')) <= 0;
+      if (key.toLowerCase() === 'expires') return Date.parse(parts.join('=')) <= Date.now();
+      return false;
+    });
+    if (!value || expired) cookies.delete(name);
+    else cookies.set(name, value);
+  }
+  return [...cookies].map(([name, value]) => `${name}=${value}`).join('; ');
+}
+
+async function refreshAccessToken(provider, origin, context, signal) {
+  if (!context.cookie) return false;
+  const headers = { Accept: 'application/json', Cookie: context.cookie, 'Cache-Control': 'no-cache, no-store' };
+  if (context.session) headers['X-Auth-Session'] = context.session;
+  const response = await fetch(`${origin}/api/user/auth/refresh`, { method: 'POST', headers, signal });
+  context.cookie = updateCookieHeader(context.cookie, response);
+  provider.accountCookie = context.cookie;
+  if (context.cookie) context.headers.Cookie = context.cookie;
+  else delete context.headers.Cookie;
+  const text = await response.text();
+  let body;
+  try { body = JSON.parse(text); } catch { body = null; }
+  if (response.status === 404 || response.status === 405) return false;
+  if (!response.ok || body?.success === false) {
+    const error = new Error(response.status === 401
+      ? 'New API 登录会话已失效，请在连接窗口退出账户后重新登录'
+      : `New API 会话刷新失败 (${response.status})${body?.code ? `: ${body.code}` : ''}`);
+    error.status = response.status;
+    error.rateLimited = response.status === 429;
+    throw error;
+  }
+  const bundle = unwrap(body);
+  const token = String(bundle?.access_token || bundle?.accessToken || '').trim().replace(/^Bearer\s+/i, '');
+  if (token.length < 16 || /\s/.test(token)) throw new Error('New API 刷新响应缺少有效的 access_token');
+  context.headers.Authorization = `Bearer ${token}`;
+  provider.accountToken = token;
+  if (bundle?.session?.sid) {
+    context.session = String(bundle.session.sid);
+    provider.accountSession = context.session;
+    context.headers['X-Auth-Session'] = context.session;
+  }
+  if (bundle?.user?.id != null) {
+    provider.accountUserId = String(bundle.user.id);
+    context.headers['New-Api-User'] = provider.accountUserId;
+  }
+  return true;
+}
+
+async function getJson(url, headers, signal, method = 'GET', onUnauthorized) {
+  let response = await fetch(url, { method, headers, signal });
+  if (response.status === 401 && typeof onUnauthorized === 'function' && await onUnauthorized()) {
+    response = await fetch(url, { method, headers, signal });
+  }
   const text = await response.text();
   let body;
   try { body = JSON.parse(text); } catch { body = null; }
@@ -103,6 +177,19 @@ async function getJson(url, headers, signal) {
     throw error;
   }
   return payload;
+}
+
+function authContext(provider, origin, signal) {
+  const context = requestHeaders(provider);
+  let refreshPromise = null;
+  const refresh = async () => {
+    if (!context.cookie) return false;
+    if (!refreshPromise) {
+      refreshPromise = refreshAccessToken(provider, origin, context, signal).finally(() => { refreshPromise = null; });
+    }
+    return refreshPromise;
+  };
+  return { ...context, refresh };
 }
 
 function todayStart() {
@@ -143,28 +230,59 @@ module.exports = {
   id: 'new-api',
   label: 'New API',
   async detect(provider) {
-    const { headers, token, cookie } = requestHeaders(provider);
-    if (!token && !cookie && !provider.accountUserId) return notConfigured('New API', '网页授权凭据');
     const origin = originFor(provider);
+    const { token, cookie } = requestHeaders(provider);
+    if (!token && !cookie && !provider.accountUserId) return notConfigured('New API', '网页授权凭据');
     if (!origin) throw new Error('New API 登录地址无效');
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15000);
     try {
-      const profile = await getJson(`${origin}/api/user/self`, headers, controller.signal);
+      const request = authContext(provider, origin, controller.signal);
+      const profile = await getJson(`${origin}/api/user/self`, request.headers, controller.signal, 'GET', request.refresh);
       return { profile };
     } finally {
       clearTimeout(timer);
     }
   },
-  async getBalance(provider) {
-    const { headers, token, cookie } = requestHeaders(provider);
-    if (!token && !cookie && !provider.accountUserId) return notConfigured('New API', '点击“连接账户”完成网页授权，或填写备用登录令牌');
+  async getApiKeys(provider) {
     const origin = originFor(provider);
+    const { token, cookie } = requestHeaders(provider);
+    if (!token && !cookie && !provider.accountUserId) throw new Error('请先连接 New API 账户');
+    if (!origin) throw new Error('New API 登录地址无效');
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 30000);
+    try {
+      const request = authContext(provider, origin, controller.signal);
+      const keys = [];
+      for (let page = 1; page <= 100; page += 1) {
+        const list = await getJson(`${origin}/api/token/?p=${page}&size=100`, request.headers, controller.signal, 'GET', request.refresh);
+        const items = Array.isArray(list) ? list : list?.items;
+        if (!Array.isArray(items)) throw new Error('New API 令牌列表响应格式无效');
+        for (const item of items) {
+          if (item?.id == null) continue;
+          // New API exposes the key reveal action as POST, even though the list is read with GET.
+          const detail = await getJson(`${origin}/api/token/${encodeURIComponent(item.id)}/key`, request.headers, controller.signal, 'POST', request.refresh);
+          const rawKey = String(detail?.key || '').trim();
+          if (rawKey) keys.push({ key: /^sk-/i.test(rawKey) ? rawKey : `sk-${rawKey}`, name: String(item?.name || item?.remark || '').trim() });
+        }
+        if (items.length < 100) break;
+      }
+      if (!keys.length) throw new Error('该 New API 账户没有可导入的 API 密钥');
+      return keys;
+    } finally {
+      clearTimeout(timer);
+    }
+  },
+  async getBalance(provider) {
+    const origin = originFor(provider);
+    const { token, cookie } = requestHeaders(provider);
+    if (!token && !cookie && !provider.accountUserId) return notConfigured('New API', '点击“连接账户”完成网页授权，或填写备用登录令牌');
     if (!origin) throw new Error('New API 登录地址无效');
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 20000);
     try {
-      const profile = provider._accountProfile || await getJson(`${origin}/api/user/self`, headers, controller.signal);
+      const request = authContext(provider, origin, controller.signal);
+      const profile = provider._accountProfile || await getJson(`${origin}/api/user/self`, request.headers, controller.signal, 'GET', request.refresh);
       const user = unwrap(profile);
       const rawBalance = findNumber(user, ['quota', 'remaining_quota', 'remainingQuota', 'balance', 'credit']);
       const balance = quotaAmount(rawBalance);
@@ -172,8 +290,8 @@ module.exports = {
       let stats = null;
       let logs = null;
       await Promise.all([
-        getJson(`${origin}/api/performance/stats`, headers, controller.signal).then(value => { stats = value; }).catch(() => {}),
-        getJson(`${origin}/api/performance/logs`, headers, controller.signal).then(value => { logs = value; }).catch(() => {})
+        getJson(`${origin}/api/performance/stats`, request.headers, controller.signal, 'GET', request.refresh).then(value => { stats = value; }).catch(() => {}),
+        getJson(`${origin}/api/performance/logs`, request.headers, controller.signal, 'GET', request.refresh).then(value => { logs = value; }).catch(() => {})
       ]);
       const parsedStats = statsFromPayload(stats, logs);
       const accountStats = Object.fromEntries(Object.entries(parsedStats).filter(([, value]) => value != null && Number.isFinite(Number(value))));

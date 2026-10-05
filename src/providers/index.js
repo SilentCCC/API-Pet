@@ -3,5 +3,6 @@ module.exports = {
   'one-api': require('./one-api'),
   veloera: require('./veloera'),
   sub2api: require('./sub2api'),
+  aihub: require('./aihub'),
   custom: require('./custom')
 };

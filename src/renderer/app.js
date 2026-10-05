@@ -28,16 +28,73 @@ let chatSending = false;
 let chatImageQueue = Promise.resolve();
 const CHAT_IMAGE_LIMIT = 4;
 const CHAT_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
+let drawingOptions = { resolution: '1K', ratio: '1:1', width: 1024, height: 1024, quality: 'high', count: 1,
+  responseFormat: 'b64_json', editEndpoint: 'auto', watermark: true, promptExtend: true, outputFormat: 'png' };
 let providersCollapsed = localStorage.getItem('api-pet-providers-collapsed') === 'true';
 let collapsedProviderIds = new Set(JSON.parse(localStorage.getItem('api-pet-collapsed-provider-ids') || '[]'));
 let expandedProviderIds = new Set(JSON.parse(localStorage.getItem('api-pet-expanded-provider-ids') || '[]'));
 let providerTokenRows = [];
+let providerDrag = null;
+let providerOrderSaving = false;
 let draftAccountData = null;
 const panel = $('panel');
 const chatPanel = $('chatPanel');
 const dialog = $('providerDialog');
 const appRoot = document.querySelector('.app');
 let panelHeight = 430;
+let panelWidth = 450;
+function setupPanelWidthResize() {
+  window.apiPet.onPanelWidth(width => {
+    panelWidth = width;
+    panel.style.width = `${width}px`;
+  });
+  const handle = document.createElement('div');
+  handle.className = 'panel-width-handle';
+  handle.title = '调节控制面板宽度（400–500 像素）';
+  let drag = null;
+  let pendingWidth = null;
+  let sending = false;
+  async function flushResize() {
+    if (sending) return;
+    sending = true;
+    try {
+      while (pendingWidth != null) {
+        const width = pendingWidth;
+        pendingWidth = null;
+        await window.apiPet.resizePanelWidth(width);
+      }
+    } catch (error) {
+      pendingWidth = null;
+      toast(`调整宽度失败：${error?.message || error}`);
+    } finally { sending = false; }
+  }
+  handle.onpointerdown = event => {
+    if (event.button !== 0) return;
+    event.preventDefault();
+    drag = { pointerId: event.pointerId, x: event.screenX, width: panelWidth };
+    handle.setPointerCapture(event.pointerId);
+    handle.classList.add('resizing');
+    appRoot.classList.add('resizing-panel-width');
+  };
+  handle.onpointermove = event => {
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    pendingWidth = Math.min(500, Math.max(400, drag.width + event.screenX - drag.x));
+    flushResize();
+  };
+  const finish = () => {
+    drag = null;
+    handle.classList.remove('resizing');
+    appRoot.classList.remove('resizing-panel-width');
+  };
+  handle.onpointerup = event => {
+    if (!drag || event.pointerId !== drag.pointerId) return;
+    handle.releasePointerCapture(event.pointerId);
+    finish();
+  };
+  handle.onpointercancel = finish;
+  handle.onlostpointercapture = finish;
+  panel.prepend(handle);
+}
 function setupPanelHeightResize() {
   window.apiPet.onPanelHeight(height => {
     panelHeight = height;
@@ -167,6 +224,7 @@ async function setPanelVisible(visible) {
   appRoot.classList.toggle('panel-open', visible);
   const synced = await window.apiPet.setPanelOpen(visible);
   panel.classList.toggle('hidden', !visible);
+  if (visible) updateCompactMoneyColumns();
   chatPanel.classList.add('hidden');
   if (!synced) appRoot.classList.toggle('panel-open', visible);
 }
@@ -198,6 +256,12 @@ function escapeHtml(value) {
 }
 function statusLabel(provider) {
   return provider.status === 'online' ? '🟢 连接正常' : provider.status === 'error' ? '🔴 连接失败' : '🟡 未测试';
+}
+function formatCompactMoney(value, currency) {
+  const amount = value != null && String(value).trim() !== '' && Number.isFinite(Number(value))
+    ? Number(value).toFixed(4)
+    : '-.----';
+  return `${currency || '$'}${amount}`;
 }
 function balanceLabel(provider) {
   const status = provider.balance?.status;
@@ -252,26 +316,33 @@ function ensureProviderToggle() {
 function moveGatewayIntoRouting() {
   const routes = $('routes');
   const routingTitle = [...document.querySelectorAll('.section-title')].find(item => item.querySelector('span')?.textContent.trim() === '路由设置');
-  const gatewayTitle = [...document.querySelectorAll('.section-title')].find(item => item.querySelector('span')?.textContent.trim() === '本地统一 API');
-  const gatewayCard = document.querySelector('.gateway-card');
-  const keyLine = document.querySelector('.key-line');
+  const gateway = $('localGateway');
   const controls = $('routingEnabled')?.closest('.routing-controls');
-  if (!routes || !routingTitle || !gatewayCard || !keyLine || !controls) return;
-  gatewayTitle?.remove();
+  if (!routes || !routingTitle || !gateway || !controls) return;
   let wrapper = $('routingGateway');
   if (!wrapper) {
     wrapper = document.createElement('div');
     wrapper.id = 'routingGateway';
     controls.after(wrapper);
   }
-  wrapper.append(gatewayCard, keyLine);
+  wrapper.append(gateway);
+}
+async function copyGatewayValue(id, label) {
+  try {
+    await navigator.clipboard.writeText($(id).textContent);
+    toast(`${label} 已复制`);
+  } catch (error) {
+    toast(`复制失败：${error?.message || error}`);
+  }
 }
 function render() {
+  if (providerDrag?.dragging) return;
+  providerDrag?.cancel();
   $('unifiedKey').textContent = appState.unifiedKey;
   $('lowThreshold').value = appState.balanceSettings?.lowThreshold ?? 5;
   $('refreshMinutes').value = appState.balanceSettings?.refreshMinutes ?? 10;
   const allProvidersCollapsed = providersCollapsed || (appState.providers.length > 0 && appState.providers.every(provider => collapsedProviderIds.has(provider.id)));
-  $('refreshAllAccounts').disabled = refreshingAllAccounts || appState.providers.every(provider => !['sub2api', 'new-api'].includes(provider.balanceAdapter));
+  $('refreshAllAccounts').disabled = refreshingAllAccounts || appState.providers.every(provider => !['sub2api', 'new-api', 'aihub'].includes(provider.balanceAdapter));
   $('toggleProviders').textContent = allProvidersCollapsed ? '展开全部' : '折叠全部';
   $('toggleProviders').setAttribute('aria-expanded', String(!allProvidersCollapsed));
   const list = $('providers');
@@ -279,12 +350,14 @@ function render() {
   appState.providers.forEach((provider, index) => {
     const card = document.createElement('div');
     card.className = 'provider-card';
+    card.dataset.providerId = provider.id;
     const balance = provider.balance || {};
-    const amount = balance.balance == null ? '--' : `${escapeHtml(provider.currency || balance.currency || '$')}${Number(balance.balance).toFixed(2)}`;
+    const skipBalance = provider.balanceAdapter === 'none';
+    const amount = skipBalance ? '不查询' : balance.balance == null ? '--' : `${escapeHtml(provider.currency || balance.currency || '$')}${Number(balance.balance).toFixed(4)}`;
     const remaining = balance.remaining == null ? '--' : Number(balance.remaining).toFixed(2);
     const checked = balance.updatedAt ? new Date(balance.updatedAt).toLocaleString() : '尚未查询';
     const stats = provider.dailyStats || {};
-    const accountStats = provider.accountStats || {};
+    const accountStats = skipBalance ? {} : provider.accountStats || {};
     const hasAccountStats = Number.isFinite(Number(accountStats.todayCost)) && Number.isFinite(Number(accountStats.todayRequests));
     const localRequests = Number(stats.requestCount) || 0;
     const requests = hasAccountStats ? Number(accountStats.todayRequests) : localRequests;
@@ -293,7 +366,7 @@ function render() {
     const averageResponseMs = accountStats.averageDurationMs != null ? Number(accountStats.averageDurationMs) : NaN;
     const averageResponse = Number.isFinite(averageResponseMs) ? `${(averageResponseMs / 1000).toFixed(2)} 秒` : '--';
     const consumption = hasAccountStats ? `${escapeHtml(provider.currency || balance.currency || '$')}${Number(accountStats.todayCost).toFixed(4)}` : Number.isFinite(Number(stats.cost)) ? `${escapeHtml(stats.costCurrency || provider.currency || '$')}${Number(stats.cost).toFixed(4)}` : Number(stats.usageTokens) > 0 ? `${Number(stats.usageTokens).toLocaleString()} tokens` : '--';
-    const connectButton = ['sub2api', 'new-api'].includes(provider.balanceAdapter) ? '<button class="connect-account">连接账户</button>' : '';
+    const connectButton = ['sub2api', 'new-api', 'aihub'].includes(provider.balanceAdapter) ? '<button class="connect-account">连接账户</button>' : '';
     const displayUrl = provider.requestUrl || provider.loginUrl || provider.baseUrl || '';
   const balanceConnection = balance.apiStatus === 'online' ? '🟢 连接正常' : balance.apiStatus === 'error' ? '🔴 连接失败' : '🟡 未测试';
   const connectionIcon = provider.status === 'online' ? '🟢' : provider.status === 'error' ? '🔴' : '🟡';
@@ -302,10 +375,13 @@ function render() {
     : collapsedProviderIds.has(provider.id);
   if (compact) {
     card.classList.add('provider-card-compact');
+    if (providersCollapsed) setupProviderDragSort(card);
+    const compactConsumption = formatCompactMoney(skipBalance ? null : hasAccountStats ? accountStats.todayCost : stats.cost, hasAccountStats ? provider.currency || balance.currency : stats.costCurrency || provider.currency);
+    const compactBalance = formatCompactMoney(skipBalance ? null : balance.balance, provider.currency || balance.currency);
     const reorder = providersCollapsed ? `<div class="provider-reorder-actions">${index > 0 ? '<button class="provider-reorder" data-direction="up" type="button" aria-label="上移站点" title="上移站点">↑</button>' : '<span></span>'}${index < appState.providers.length - 1 ? '<button class="provider-reorder" data-direction="down" type="button" aria-label="下移站点" title="下移站点">↓</button>' : '<span></span>'}</div>` : '';
-    card.innerHTML = `<div class="provider-compact-name">${escapeHtml(provider.name)}</div><b class="provider-compact-consumption">${consumption}</b><b class="provider-compact-balance">${amount}</b><div class="provider-compact-actions">${reorder}<button class="provider-toggle compact-toggle" type="button" aria-label="展开 ${escapeHtml(provider.name)}">⌄</button></div>`;
+    card.innerHTML = `<div class="provider-compact-name" title="${escapeHtml(provider.name)}">${escapeHtml(provider.name)}</div><b class="provider-compact-consumption" title="今日消耗：${escapeHtml(compactConsumption)}">${escapeHtml(compactConsumption)}</b><span class="provider-compact-models" title="${provider.models?.length || 0}个模型">${provider.models?.length || 0}个模型</span><b class="provider-compact-balance" title="余额：${escapeHtml(compactBalance)}">${escapeHtml(compactBalance)}</b><span class="provider-compact-status" title="${statusLabel(provider)}" aria-label="${statusLabel(provider)}">${connectionIcon}</span><div class="provider-compact-actions">${reorder}<button class="provider-toggle compact-toggle" type="button" aria-label="展开 ${escapeHtml(provider.name)}">⌄</button></div>`;
   } else {
-    card.innerHTML = `<div class="provider-top"><div><div class="provider-name">${escapeHtml(provider.name)}</div><div class="provider-url">请求：${escapeHtml(displayUrl)}${provider.loginUrl && provider.loginUrl !== displayUrl ? `<br>登录：${escapeHtml(provider.loginUrl)}` : ''}</div></div><div class="provider-top-actions"><span class="badge ${provider.status}">${statusLabel(provider)} · ${provider.models?.length || 0} 个模型</span><button class="provider-toggle" type="button" aria-label="折叠 ${escapeHtml(provider.name)}">⌃</button></div></div><div class="balance-line"><b>${amount}</b><span>${balanceLabel(provider)}</span></div><div class="balance-meta">剩余额度：${remaining}　查询：${escapeHtml(checked)}<br>余额接口：${balanceConnection}</div><div class="provider-stats"><span>今日 Token：${todayTokens}</span><span>今日请求：${requests} 次</span><span>平均响应：${averageResponse}</span><span>今日消耗：${consumption}</span></div>${balance.error ? `<div class="balance-error">${escapeHtml(balance.error)}</div>` : ''}${provider.error ? `<div class="balance-error">${escapeHtml(provider.error)}</div>` : ''}<div class="provider-actions">${connectButton}<button class="test">测试连接</button><button class="refresh-balance">刷新余额</button><button class="edit">编辑</button><button class="delete">删除</button></div>`;
+    card.innerHTML = `<div class="provider-top"><div><div class="provider-name">${escapeHtml(provider.name)}</div><div class="provider-url">请求：${escapeHtml(displayUrl)}${provider.loginUrl && provider.loginUrl !== displayUrl ? `<br>登录：${escapeHtml(provider.loginUrl)}` : ''}</div></div><div class="provider-top-actions"><span class="badge ${provider.status}">${statusLabel(provider)} · ${provider.models?.length || 0} 个模型</span><button class="provider-toggle" type="button" aria-label="折叠 ${escapeHtml(provider.name)}">⌃</button></div></div>${skipBalance ? '' : `<div class="balance-line"><b>${amount}</b><span>${balanceLabel(provider)}</span></div><div class="balance-meta">剩余额度：${remaining}　查询：${escapeHtml(checked)}<br>余额接口：${balanceConnection}</div>`}<div class="provider-stats"><span>今日 Token：${todayTokens}</span><span>今日请求：${requests} 次</span><span>平均响应：${averageResponse}</span><span>今日消耗：${consumption}</span></div>${!skipBalance && balance.error ? `<div class="balance-error">${escapeHtml(balance.error)}</div>` : ''}${provider.error ? `<div class="balance-error">${escapeHtml(provider.error)}</div>` : ''}<div class="provider-actions">${connectButton}<button class="test">测试连接</button>${skipBalance ? '' : '<button class="refresh-balance">刷新余额</button>'}<button class="edit">编辑</button><button class="delete">删除</button></div>`;
   }
   card.querySelector('.provider-toggle')?.addEventListener('click', () => {
     if (providersCollapsed) {
@@ -323,7 +399,8 @@ function render() {
   });
   card.querySelectorAll('.provider-reorder').forEach(button => {
     button.addEventListener('click', async () => {
-      if (button.disabled) return;
+      if (button.disabled || providerOrderSaving) return;
+      providerOrderSaving = true;
       list.querySelectorAll('.provider-reorder').forEach(item => { item.disabled = true; });
       try {
         appState = await window.apiPet.moveProvider({ id: provider.id, direction: button.dataset.direction });
@@ -331,7 +408,7 @@ function render() {
       } catch (error) {
         list.querySelectorAll('.provider-reorder').forEach(item => { item.disabled = false; });
         toast(`调整顺序失败：${error?.message || error}`);
-      }
+      } finally { providerOrderSaving = false; }
     });
   });
   card.querySelector('.test')?.addEventListener('click', () => testProvider(provider.id));
@@ -341,10 +418,122 @@ function render() {
     card.querySelector('.delete')?.addEventListener('click', async () => { if (confirm('删除这个 Provider？')) { appState = await window.apiPet.deleteProvider(provider.id); render(); } });
     list.appendChild(card);
   });
+  updateCompactMoneyColumns();
   renderMode();
   renderChatTargetMenu();
   updateChatModelLabel();
   updatePetBalanceStatus();
+}
+function setupProviderDragSort(card) {
+  card.classList.add('provider-sortable');
+  card.addEventListener('pointerdown', event => {
+    if (event.button !== 0 || !event.isPrimary || event.target.closest('button') || providerOrderSaving || providerDrag) return;
+    const list = $('providers');
+    const scroller = list.closest('.panel-scroll');
+    const startX = event.clientX;
+    const startY = event.clientY;
+    let pointerY = startY;
+    let offsetY = 0;
+    let ghost;
+    let frame;
+    const session = { dragging: false, cancel: () => finish(false) };
+    providerDrag = session;
+    const cleanup = () => {
+      clearTimeout(timer);
+      cancelAnimationFrame(frame);
+      document.removeEventListener('pointermove', move);
+      document.removeEventListener('pointerup', release);
+      document.removeEventListener('pointercancel', cancel);
+      document.removeEventListener('keydown', keydown);
+      window.removeEventListener('blur', cancel);
+      list.removeEventListener('lostpointercapture', cancel);
+      providerDrag = null;
+      if (list.hasPointerCapture(event.pointerId)) list.releasePointerCapture(event.pointerId);
+      ghost?.remove();
+      card.classList.remove('provider-sort-placeholder');
+      appRoot.classList.remove('sorting-providers');
+    };
+    const finish = async save => {
+      if (providerDrag !== session) return;
+      const dragging = session.dragging;
+      const targetIndex = [...list.children].indexOf(card);
+      cleanup();
+      if (!dragging) return;
+      if (save && appState.providers.findIndex(provider => provider.id === card.dataset.providerId) !== targetIndex) {
+        providerOrderSaving = true;
+        list.querySelectorAll('button').forEach(button => { button.disabled = true; });
+        try {
+          appState = await window.apiPet.moveProvider({ id: card.dataset.providerId, targetIndex });
+        } catch (error) { toast(`调整顺序失败：${error?.message || error}`); }
+        finally { providerOrderSaving = false; }
+      }
+      render();
+    };
+    const position = () => {
+      ghost.style.top = `${pointerY - offsetY}px`;
+      const before = [...list.children].find(row => row !== card && pointerY < row.getBoundingClientRect().top + row.getBoundingClientRect().height / 2);
+      if (before) list.insertBefore(card, before);
+      else list.appendChild(card);
+    };
+    const scroll = () => {
+      const bounds = scroller.getBoundingClientRect();
+      const speed = pointerY < bounds.top + 32 ? -8 : pointerY > bounds.bottom - 32 ? 8 : 0;
+      if (speed) { scroller.scrollTop += speed; position(); }
+      frame = requestAnimationFrame(scroll);
+    };
+    const move = pointer => {
+      if (pointer.pointerId !== event.pointerId) return;
+      pointerY = pointer.clientY;
+      if (!session.dragging) {
+        if (Math.hypot(pointer.clientX - startX, pointer.clientY - startY) > 8) finish(false);
+        return;
+      }
+      pointer.preventDefault();
+      position();
+    };
+    const release = pointer => { if (pointer.pointerId === event.pointerId) finish(true); };
+    const cancel = () => finish(false);
+    const keydown = key => { if (key.key === 'Escape') { key.preventDefault(); finish(false); } };
+    const timer = setTimeout(() => {
+      const rect = card.getBoundingClientRect();
+      offsetY = startY - rect.top;
+      ghost = card.cloneNode(true);
+      ghost.classList.add('provider-sort-ghost');
+      ghost.classList.remove('provider-sortable');
+      ghost.setAttribute('aria-hidden', 'true');
+      ghost.style.left = `${rect.left}px`;
+      ghost.style.top = `${rect.top}px`;
+      ghost.style.width = `${rect.width}px`;
+      ghost.style.height = `${rect.height}px`;
+      ghost.style.gridTemplateColumns = getComputedStyle(card).gridTemplateColumns;
+      document.body.appendChild(ghost);
+      session.dragging = true;
+      card.classList.add('provider-sort-placeholder');
+      appRoot.classList.add('sorting-providers');
+      window.getSelection()?.removeAllRanges();
+      list.setPointerCapture(event.pointerId);
+      frame = requestAnimationFrame(scroll);
+    }, 400);
+    document.addEventListener('pointermove', move, { passive: false });
+    document.addEventListener('pointerup', release);
+    document.addEventListener('pointercancel', cancel);
+    document.addEventListener('keydown', keydown);
+    window.addEventListener('blur', cancel);
+    list.addEventListener('lostpointercapture', cancel);
+    list.setPointerCapture(event.pointerId);
+  });
+}
+function updateCompactMoneyColumns() {
+  if (panel.classList.contains('hidden')) return;
+  const list = $('providers');
+  const compactCards = [...list.querySelectorAll('.provider-card-compact')];
+  const moneyColumnWidth = (selector, minimum) => Math.max(minimum, ...compactCards.map(card => {
+    const range = document.createRange();
+    range.selectNodeContents(card.querySelector(selector));
+    return Math.ceil(range.getBoundingClientRect().width) + 2;
+  }));
+  list.style.setProperty('--compact-consumption-width', `${moneyColumnWidth('.provider-compact-consumption', 48)}px`);
+  list.style.setProperty('--compact-balance-width', `${moneyColumnWidth('.provider-compact-balance', 64)}px`);
 }
 function renderMode() {
   const enabled = appState.routingEnabled === true;
@@ -374,6 +563,11 @@ function renderRoutes() {
 }
 function fillProviderDialog(provider = {}) {
   ensureTokenRemarkField();
+  // A Provider can be saved before its first API key is available.
+  const legacyKeyInput = $('providerKey');
+  if (legacyKeyInput) legacyKeyInput.required = false;
+  $('quickEntryField').classList.toggle('hidden', Boolean(provider.id));
+  $('quickEntry').value = '';
   $('providerId').value = provider.id || '';
   $('providerName').value = provider.name || '';
   $('loginUrl').value = provider.loginUrl || provider.baseUrl || '';
@@ -390,10 +584,17 @@ function fillProviderDialog(provider = {}) {
   $('balancePath').value = provider.balancePath || 'data.balance';
   $('remainingPath').value = provider.remainingPath || '';
   $('currency').value = provider.currency || '$';
-  const supportsAccountLogin = ['sub2api', 'new-api'].includes($('balanceAdapter').value);
+  updateProviderTypeFields();
+}
+function updateProviderTypeFields() {
+  const type = $('balanceAdapter').value;
+  const skipBalance = type === 'none';
+  const supportsAccountLogin = ['sub2api', 'new-api', 'aihub'].includes(type);
   $('accountTokenField').classList.toggle('hidden', !supportsAccountLogin);
-  $('accountUserIdField').classList.toggle('hidden', $('balanceAdapter').value !== 'new-api');
-  ['balanceUrlField', 'balanceMethodField', 'balancePathField', 'remainingPathField'].forEach(id => $(id)?.classList.toggle('hidden', supportsAccountLogin));
+  $('accountUserIdField').classList.toggle('hidden', type !== 'new-api');
+  ['balanceUrlField', 'balanceMethodField', 'balancePathField', 'remainingPathField'].forEach(id => $(id)?.classList.toggle('hidden', supportsAccountLogin || skipBalance));
+  $('currency').closest('label').classList.toggle('hidden', skipBalance);
+  ['connectAccountInDialog', 'importProviderTokens'].forEach(id => $(id)?.classList.toggle('hidden', skipBalance));
 }
 function ensureTokenRemarkField() {
   if ($('tokenFields')) return;
@@ -430,6 +631,22 @@ function renderTokenRows() {
     };
     row.querySelector('.toggle-token-key').onclick = () => { const input = row.querySelector('.token-key'); input.type = input.type === 'password' ? 'text' : 'password'; };
   });
+  updateProviderTypeFields();
+}
+function recognizeProviderQuickEntry() {
+  const text = $('quickEntry').value.trim();
+  if (!text) { toast('请先粘贴站点信息'); return; }
+  const result = window.ProviderQuickEntry.parse(text);
+  if (result.name) $('providerName').value = result.name;
+  if (result.loginUrl) $('loginUrl').value = result.loginUrl;
+  if (result.apiKey) {
+    const index = Math.max(0, providerTokenRows.findIndex(row => row.enabled));
+    providerTokenRows[index].key = result.apiKey;
+    renderTokenRows();
+  }
+  const missing = [[result.loginUrl, '登录地址'], [result.apiKey, 'API Key']].filter(([value]) => !value).map(([, label]) => label);
+  if (missing.length === 2 && !result.name) toast('未识别到站点信息，请粘贴网址和 API Key');
+  else toast(missing.length ? `已填写识别到的信息；未识别到${missing.join('、')}，请手动补充` : '已识别并填写名称、登录地址和 API Key，请核对后保存');
 }
 async function importProviderTokens() {
   const button = $('importProviderTokens');
@@ -469,18 +686,18 @@ function collectProviderDraft() {
     currency: $('currency').value
   };
 }
-function openEdit(provider) { editingId = provider.id; draftAccountData = null; $('dialogTitle').textContent = '编辑 Provider'; fillProviderDialog(provider); dialog.showModal(); }
-function openAdd() { editingId = null; draftAccountData = null; $('dialogTitle').textContent = '添加 Provider'; fillProviderDialog(); dialog.showModal(); }
+function openEdit(provider) { editingId = provider.id; draftAccountData = null; $('dialogTitle').textContent = '编辑 Provider'; fillProviderDialog(provider); appRoot.classList.add('provider-dialog-open'); dialog.showModal(); }
+function openAdd() { editingId = null; draftAccountData = null; $('dialogTitle').textContent = '添加 Provider'; fillProviderDialog(); appRoot.classList.add('provider-dialog-open'); dialog.showModal(); }
 async function saveProviderAndTest() {
   const form = $('providerForm');
   if (!form.reportValidity()) return;
   const apiKeys = providerTokenRows.map(row => ({ key: String(row.key || '').trim(), remark: String(row.remark || '').trim(), enabled: row.enabled !== false })).filter(row => row.key);
-  if (!apiKeys.some(row => row.enabled)) { toast('请至少勾选一个有效 API Key'); return; }
   appState = await window.apiPet.saveProvider({ id: editingId, name: $('providerName').value, loginUrl: $('loginUrl').value, requestUrl: $('requestUrl').value, apiKeys, apiKey: apiKeys.find(row => row.enabled)?.key || apiKeys[0]?.key || '', tokenRemark: apiKeys.find(row => row.enabled)?.remark || '', accountToken: $('accountToken').value, accountRefreshToken: draftAccountData?.accountRefreshToken || '', accountCookie: draftAccountData?.accountCookie || '', accountSession: draftAccountData?.accountSession || '', accountUserId: $('accountUserId').value, accountStats: draftAccountData?.accountStats || null, balance: draftAccountData?.balance || null, balanceAdapter: $('balanceAdapter').value, balanceUrl: $('balanceUrl').value, balanceMethod: $('balanceMethod').value, balancePath: $('balancePath').value, remainingPath: $('remainingPath').value, currency: $('currency').value });
   dialog.close();
   render();
   const provider = appState.providers.find(item => item.id === editingId) || appState.providers.at(-1);
-  if (provider) await testProvider(provider.id);
+  if (provider && provider.apiKey) await testProvider(provider.id);
+  else toast('Provider 已保存；添加 API Key 后再测试连接');
 }
 async function testProvider(id) {
   if (providerTestsActive === 0) connectionAnimationPlayed = false;
@@ -541,7 +758,7 @@ async function connectProviderAccount(id, loginUrl = '', { silent = false } = {}
 }
 async function refreshAllProviderAccounts() {
   const button = $('refreshAllAccounts');
-  const providers = appState.providers.filter(provider => ['sub2api', 'new-api'].includes(provider.balanceAdapter));
+  const providers = appState.providers.filter(provider => ['sub2api', 'new-api', 'aihub'].includes(provider.balanceAdapter));
   if (!providers.length || refreshingAllAccounts) return;
   refreshingAllAccounts = true;
   button.disabled = true;
@@ -564,10 +781,21 @@ async function refreshAllProviderAccounts() {
   } finally {
     refreshingAllAccounts = false;
     button.textContent = '一键刷新账户';
-    button.disabled = appState.providers.every(provider => !['sub2api', 'new-api'].includes(provider.balanceAdapter));
+    button.disabled = appState.providers.every(provider => !['sub2api', 'new-api', 'aihub'].includes(provider.balanceAdapter));
   }
 }
 let chatHistory = [];
+function clearChatContext() {
+  if (chatSending) return;
+  chatHistory = [];
+  const empty = document.createElement('div');
+  empty.className = 'chat-empty';
+  empty.textContent = '输入消息，开始对话';
+  $('chatMessages').replaceChildren(empty);
+  document.querySelectorAll('.image-viewer').forEach(viewer => { viewer.close(); viewer.remove(); });
+  toast('对话记录和上下文已清空');
+  $('chatInput').focus();
+}
 function currentChatFormat() {
   return appState?.routingMode === 'unified' && appState?.unifiedRoute?.format === 'chat/completions'
     ? 'chat/completions' : 'responses';
@@ -672,6 +900,7 @@ function renderChatTargetMenu() {
   const keySelect = $('chatKey');
   const modelSelect = $('chatModel');
   if (!siteSelect || !keySelect || !modelSelect || !appState) return;
+  siteSelect.disabled = chatSending;
   const sites = appState.providers || [];
   const selectedSite = sites.find(provider => provider.id === chatSiteSelection);
   const keys = selectedSite?.apiKeys || (selectedSite?.apiKey ? [{ key: selectedSite.apiKey, remark: selectedSite.tokenRemark || '' }] : []);
@@ -704,14 +933,74 @@ function renderChatTargetMenu() {
   siteSelect.value = chatSiteSelection;
   keySelect.value = selectedSite && keys[keyIndex] ? String(keyIndex) : '';
   if (!chatModelsLoading) modelSelect.value = chatModelSelection;
+  if (chatSending) [siteSelect, keySelect, modelSelect].forEach(select => { select.disabled = true; });
+}
+function currentDrawingModel() {
+  const model = currentChatModel();
+  if (model !== 'Pet model') return model;
+  return (getChatSite() ? chatFetchedModels[0] || getChatSite().models?.[0] : appState?.unifiedRoute?.model) || '';
+}
+function renderDrawingParameters() {
+  let parameters = $('drawingParameters');
+  if (!parameters) {
+    parameters = document.createElement('div');
+    parameters.id = 'drawingParameters';
+    parameters.className = 'drawing-parameters hidden';
+    $('chatForm').before(parameters);
+    parameters.addEventListener('change', event => {
+      const field = event.target.dataset.drawing;
+      if (!field) return;
+      drawingOptions[field] = ['width', 'height', 'count'].includes(field) ? Number(event.target.value)
+        : ['watermark', 'promptExtend'].includes(field) ? event.target.value === 'on' : event.target.value;
+      renderDrawingParameters();
+    });
+  }
+  const drawing = $('chatMode').value === 'image';
+  parameters.classList.toggle('hidden', !drawing);
+  if (!drawing) return;
+  const model = currentDrawingModel(), kind = imageConfig.modelKind(model);
+  if (['gemini', 'sense-fast'].includes(kind) && drawingOptions.resolution === 'custom') drawingOptions.resolution = '1K';
+  const selection = imageConfig.getImageSizeSelection({ ...drawingOptions, model });
+  Object.assign(drawingOptions, selection);
+  if (kind === 'sense-lite') drawingOptions.count = 1;
+  const sizes = imageConfig.getImageSizeOptions(model, selection.resolution);
+  const field = (label, key, options) => `<label>${label}<select data-drawing="${key}" ${chatSending ? 'disabled' : ''}>${options.map(([value, text]) => `<option value="${value}" ${String(drawingOptions[key]) === String(value) ? 'selected' : ''}>${text}</option>`).join('')}</select></label>`;
+  const resolutions = sizes.resolutions.map(value => [value, value === 'auto' ? '自动' : value]);
+  if (!['gemini', 'grok', 'grok-json', 'sense-fast'].includes(kind)) resolutions.push(['custom', '自定义']);
+  let html = field('分辨率', 'resolution', resolutions);
+  if (selection.resolution === 'custom') {
+    for (const key of ['width', 'height']) html += `<label>${key === 'width' ? '宽度' : '高度'}<input type="number" data-drawing="${key}" min="${kind === 'sense-lite' ? 512 : 1}" max="${kind === 'sense-lite' ? 4096 : 16384}" step="${kind === 'sense-lite' ? 32 : 1}" value="${selection[key]}" ${chatSending ? 'disabled' : ''}></label>`;
+  } else if (selection.resolution !== 'auto' || kind === 'gemini') html += field('比例', 'ratio', sizes.ratios.map(value => [value, value]));
+  if (kind.startsWith('sense')) {
+    html += field('水印', 'watermark', [['on', '开'], ['off', '关']]);
+    if (kind === 'sense-lite') {
+      html += field('自动润色', 'promptExtend', [['on', '开'], ['off', '关']]);
+      html += field('输出格式', 'outputFormat', [['png', 'PNG'], ['jpeg', 'JPEG'], ['webp', 'WebP']]);
+    }
+  } else if (kind !== 'gemini') {
+    const qualities = kind === 'grok-json' ? [['medium', '中'], ['low', '低'], ['auto', '自动']] : [['high', '高'], ['medium', '中'], ['low', '低'], ['auto', '自动']];
+    if (!qualities.some(([value]) => value === drawingOptions.quality)) drawingOptions.quality = 'auto';
+    html += field('质量', 'quality', qualities);
+  }
+  html += field('数量', 'count', (kind === 'sense-lite' ? [1] : [1, 2, 3, 4, 5]).map(value => [value, `${value} 张`]));
+  if (kind !== 'gemini' && kind !== 'seedream') html += field('返回方式', 'responseFormat', [['url', 'URL'], ['b64_json', 'Base64']]);
+  if (chatImages.length && ['generic', 'grok', 'grok-json'].includes(kind)) html += field('图生图接口', 'editEndpoint', [['auto', '自动'], ['edits', 'edits'], ['generations', 'generations']]);
+  parameters.innerHTML = html;
+  // Boolean controls use on/off values, while request options retain actual booleans.
+  ['watermark', 'promptExtend'].forEach(key => {
+    const select = parameters.querySelector(`[data-drawing="${key}"]`);
+    if (select) select.value = drawingOptions[key] ? 'on' : 'off';
+  });
 }
 function updateChatModelLabel() {
   const model = currentChatModel();
-  const format = currentChatFormat();
+  const drawing = $('chatMode').value === 'image';
+  const format = drawing ? (chatImages.length ? '图生图' : '文生图') : `/v1/${currentChatFormat()}`;
   const enabled = Boolean(model);
   const site = getChatSite();
   const targetLabel = site ? `${site.name} · ${model}` : model;
-  $('chatModelLabel').textContent = enabled && model ? `${targetLabel} · /v1/${format}` : '请先选择可用模型';
+  $('chatModelLabel').textContent = enabled && model ? `${targetLabel} · ${format}` : '请先选择可用模型';
+  renderDrawingParameters();
 }
 function appendChatMessage(role, text, images = []) {
   const list = $('chatMessages');
@@ -771,13 +1060,97 @@ async function sendChatMessage(text) {
 }
 function updateChatMode() {
   const imageMode = $('chatMode').value === 'image';
+  chatPanel.classList.toggle('image-mode', imageMode);
   $('chatInput').placeholder = imageMode ? '描述你想生成的图片…' : '输入你的消息…';
-  $('sendChat').disabled = imageMode || chatSending || chatImagesLoading > 0;
+  $('sendChat').disabled = chatSending || chatImagesLoading > 0;
+  $('clearChat').disabled = chatSending;
   $('chatMode').disabled = chatSending;
   $('addChatImage').disabled = chatSending;
-  $('chatInput').required = chatImages.length === 0;
-  if (imageMode) $('sendChat').title = '绘图尚未接入';
-  else $('sendChat').removeAttribute('title');
+  $('chatInput').required = imageMode || chatImages.length === 0;
+  $('sendChat').removeAttribute('title');
+  $('sendChat').textContent = chatSending ? (imageMode ? '生成中…' : '请求中…') : imageMode ? '生成' : '发送';
+  updateChatModelLabel();
+}
+function enableGeneratedImageCopy(element, url) {
+  element.addEventListener('contextmenu', async event => {
+    event.preventDefault();
+    try {
+      const result = await window.apiPet.showGeneratedImageMenu(url);
+      if (!result.ok) throw new Error(result.error || '复制失败');
+      if (result.copied) toast('图片已复制');
+    } catch (error) { toast(`复制失败：${error.message}`); }
+  });
+}
+function showGeneratedImages(message, images) {
+  message.className = 'chat-message assistant generated-message';
+  message.replaceChildren();
+  images.forEach((image, index) => {
+    const card = document.createElement('div');
+    card.className = 'generated-image';
+    const preview = document.createElement('img');
+    preview.src = image.url;
+    preview.alt = `生成图片 ${index + 1}`;
+    preview.title = '点击放大，右键复制';
+    enableGeneratedImageCopy(preview, image.url);
+    preview.onerror = () => { preview.alt = '图片预览失败，请点击保存重试'; };
+    preview.onclick = () => {
+      const viewer = document.createElement('dialog');
+      viewer.className = 'image-viewer';
+      const full = document.createElement('img');
+      full.src = image.url; full.alt = preview.alt;
+      enableGeneratedImageCopy(full, image.url);
+      const close = document.createElement('button');
+      close.type = 'button'; close.className = 'icon'; close.textContent = '×'; close.setAttribute('aria-label', '关闭图片预览');
+      close.onclick = () => viewer.close();
+      viewer.append(close, full); document.body.appendChild(viewer);
+      viewer.onclose = () => viewer.remove(); viewer.showModal();
+    };
+    const save = document.createElement('button');
+    save.type = 'button'; save.className = 'ghost small'; save.textContent = '保存图片';
+    save.onclick = async () => {
+      save.disabled = true;
+      try {
+        const result = await window.apiPet.saveGeneratedImage(image.url);
+        if (!result.ok) throw new Error(result.error);
+        if (!result.canceled) toast('图片已保存');
+      } catch (error) { toast(`保存失败：${error.message}`); }
+      finally { save.disabled = false; }
+    };
+    card.append(preview, save);
+    if (image.warning) { const warning = document.createElement('div'); warning.className = 'generation-warning'; warning.textContent = image.warning; card.appendChild(warning); }
+    message.appendChild(card);
+  });
+  $('chatMessages').scrollTop = $('chatMessages').scrollHeight;
+}
+async function handleDrawingSubmit(text) {
+  if (!text) return;
+  const images = chatImages;
+  const request = { ...drawingOptions, prompt: text, model: currentChatModel(), providerId: currentChatProviderId(),
+    apiKeyIndex: currentChatKeyIndex(), targetModel: currentDrawingModel(), referenceImages: images.map(image => image.url) };
+  chatImages = []; chatSending = true;
+  $('chatInput').value = '';
+  renderChatAttachments(); renderChatTargetMenu();
+  appendChatMessage('user', text, images);
+  const pending = appendChatMessage('assistant pending', images.length ? '正在根据参考图生成…' : '正在生成图片…');
+  providerTestsActive += 1; updatePetAnimation();
+  try {
+    const result = await window.apiPet.generateImages(request);
+    if (!result.ok) throw new Error(result.error || '绘图失败');
+    showGeneratedImages(pending, result.images);
+    if (result.errors?.length) {
+      const warning = document.createElement('div'); warning.className = 'generation-warning';
+      warning.textContent = `部分生成失败：${result.errors.join('；')}。已保留成功图片。`;
+      pending.appendChild(warning);
+    }
+  } catch (error) {
+    pending.className = 'chat-message error'; pending.textContent = error.message || '绘图失败';
+    $('chatInput').value = [text, $('chatInput').value].filter(Boolean).join('\n');
+    chatImages = images;
+  } finally {
+    chatSending = false;
+    providerTestsActive = Math.max(0, providerTestsActive - 1); updatePetAnimation();
+    renderChatAttachments(); renderChatTargetMenu(); $('chatInput').focus();
+  }
 }
 function renderChatAttachments() {
   const tray = $('chatAttachments');
@@ -875,10 +1248,12 @@ async function handleChatSubmit(event) {
   const input = $('chatInput');
   const sendButton = $('sendChat');
   const text = input.value.trim();
-  if ((!text && !chatImages.length) || sendButton.disabled || $('chatMode').value !== 'text') return;
+  if ((!text && !chatImages.length) || sendButton.disabled) return;
+  if ($('chatMode').value === 'image') { await handleDrawingSubmit(text); return; }
   const images = chatImages;
   chatImages = [];
   chatSending = true;
+  renderChatTargetMenu();
   renderChatAttachments();
   input.value = '';
   appendChatMessage('user', text, images);
@@ -903,7 +1278,7 @@ async function handleChatSubmit(event) {
   } finally {
     chatSending = false;
     renderChatAttachments();
-    sendButton.textContent = '发送';
+    renderChatTargetMenu();
     input.focus();
   }
 }
@@ -920,6 +1295,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   dialog.querySelector('.dialog-head')?.after(dialogToast);
   ensureChatTargetMenu();
   setupPanelHeightResize();
+  setupPanelWidthResize();
   window.apiPet.onBalanceActivity(setBalanceActivity);
   appState = await window.apiPet.getState();
   setBalanceActivity(await window.apiPet.getBalanceActivity());
@@ -930,14 +1306,28 @@ window.addEventListener('DOMContentLoaded', async () => {
   $('openChat').onclick = () => setChatVisible(chatPanel.classList.contains('hidden'));
   $('openSettings').onclick = () => setPanelVisible(panel.classList.contains('hidden'));
   $('chatForm').onsubmit = handleChatSubmit;
+  $('clearChat').onclick = clearChatContext;
   $('chatMode').onchange = updateChatMode;
   setupChatImageUpload();
   updateChatMode();
   $('closeChat').onclick = () => setChatVisible(false);
   $('closePanel').onclick = () => setPanelVisible(false);
   $('addProvider').onclick = openAdd;
+  $('recognizeProvider').onclick = recognizeProviderQuickEntry;
+  $('quickEntry').onpaste = event => {
+    const text = event.clipboardData?.getData('text/plain') || '';
+    if (/[\r\n]/.test(text)) {
+      event.preventDefault();
+      $('quickEntry').setRangeText(text.replace(/[\r\n]+/g, ' '), $('quickEntry').selectionStart, $('quickEntry').selectionEnd, 'end');
+    }
+  };
+  $('quickEntry').onkeydown = event => {
+    if (event.key === 'Enter' && !event.isComposing) { event.preventDefault(); recognizeProviderQuickEntry(); }
+  };
   $('quit').onclick = () => window.apiPet.quit();
-  $('copyKey').onclick = () => navigator.clipboard.writeText(appState.unifiedKey).then(() => toast('统一 Key 已复制'));
+  $('copyUrl').onclick = () => copyGatewayValue('unifiedUrl', 'URL');
+  $('copyKey').onclick = () => copyGatewayValue('unifiedKey', '统一 Key');
+  $('copyModel').onclick = () => copyGatewayValue('unifiedModel', 'Pet 模型');
   $('refreshAllBalances').onclick = async () => {
     beginManualBalanceQuery();
     toast('正在刷新余额…');
@@ -952,7 +1342,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   $('saveBalanceSettings').onclick = async () => { appState = await window.apiPet.setBalanceSettings({ lowThreshold: $('lowThreshold').value, refreshMinutes: $('refreshMinutes').value }); render(); toast('余额设置已保存'); };
   $('routingEnabled').onchange = async () => { appState = await window.apiPet.setRoutingEnabled($('routingEnabled').checked); renderMode(); toast(appState.routingEnabled ? '已启用模型路由' : '已关闭模型路由'); };
   $('routingMode').onchange = async () => { appState = await window.apiPet.setRoutingMode($('routingMode').value); renderMode(); toast($('routingMode').value === 'unified' ? '已切换到统一路由模式' : '已切换到模型路由模式'); };
-  $('balanceAdapter').onchange = () => { const supportsAccountLogin = ['sub2api', 'new-api'].includes($('balanceAdapter').value); $('accountTokenField').classList.toggle('hidden', !supportsAccountLogin); $('accountUserIdField').classList.toggle('hidden', $('balanceAdapter').value !== 'new-api'); ['balanceUrlField', 'balanceMethodField', 'balancePathField', 'remainingPathField'].forEach(id => $(id)?.classList.toggle('hidden', supportsAccountLogin)); };
+  $('balanceAdapter').onchange = updateProviderTypeFields;
   $('connectAccountInDialog').onclick = () => connectProviderAccount(editingId, $('loginUrl').value.trim());
   ensureTokenRemarkField();
   $('providerForm').onsubmit = event => event.preventDefault();
@@ -962,8 +1352,10 @@ window.addEventListener('DOMContentLoaded', async () => {
     button.type = 'button';
     button.onclick = () => dialog.close('cancel');
   });
-  dialog.addEventListener('close', () => $('dialogToast')?.classList.remove('show'));
+  dialog.addEventListener('close', () => {
+    appRoot.classList.remove('provider-dialog-open');
+    $('dialogToast')?.classList.remove('show');
+  });
   window.apiPet.onGatewayStatus(setStatus);
   window.apiPet.onShowPanel(() => setPanelVisible(true));
 });
-

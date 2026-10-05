@@ -8,7 +8,8 @@ const { test } = require('node:test');
 function loadAdapter(fetch) {
   const source = fs.readFileSync(path.join(__dirname, '../src/providers/sub2api.js'), 'utf8');
   const adapterRequire = createRequire(path.join(__dirname, '../src/providers/sub2api.js'));
-  const context = vm.createContext({ module: { exports: {} }, require: adapterRequire, fetch, URL, AbortController, setTimeout, clearTimeout });
+  const context = vm.createContext({ module: { exports: {} }, require: name => name === './base'
+    ? { ...adapterRequire(name), accountFetch: fetch } : adapterRequire(name), URL, AbortController, setTimeout, clearTimeout });
   vm.runInContext(source, context);
   return context.module.exports;
 }
@@ -130,6 +131,62 @@ test('existing Sub2API accounts without refresh tokens retain pagination and nam
   assert.equal(keys.length, 2);
   assert.equal(keys[1].name, 'key 2');
   assert.equal(pages, 2);
+});
+
+test('account profile falls back to auth/me and retains the returned balance and statistics', async () => {
+  const calls = [];
+  const record = provider();
+  delete record.accountRefreshToken;
+  const adapter = loadAdapter(async (url, options) => {
+    const pathname = new URL(url).pathname;
+    calls.push(pathname);
+    assert.equal(options.headers.Authorization, 'Bearer test-expired-access-token');
+    assert.equal(options.headers.Cookie, 'server_session_test=test-cookie');
+    assert.equal(options.headers['X-User-UI-Request'], '1');
+    if (pathname.endsWith('/user/profile')) return json({ message: 'Not Found' }, 404);
+    if (pathname.endsWith('/auth/me')) return json({ code: 0, data: { id: 123, balance: '0.1234' } });
+    return json({ code: 0, data: { today_actual_cost: '0.0001', today_requests: 2 } });
+  });
+  const detection = await adapter.detect(record);
+  const result = await adapter.getBalance({ ...record, _accountProfile: detection.profile });
+  assert.equal(result.balance, 0.1234);
+  assert.equal(result.accountStats.todayCost, 0.0001);
+  assert.equal(result.accountStats.todayRequests, 2);
+  assert.deepEqual(calls, ['/api/v1/user/profile', '/api/v1/auth/me', '/api/v1/usage/dashboard/stats']);
+});
+
+test('auth/me supplies balance when user/profile contains no balance field', async () => {
+  const adapter = loadAdapter(async url => json({ code: 0, data: String(url).endsWith('/auth/me')
+    ? { user: { balance: 0 } } : { id: 123 } }));
+  const result = await adapter.getBalance(provider());
+  assert.equal(result.balance, 0);
+  assert.equal(result.accountStats.todayCost, null);
+});
+
+test('unavailable or incomplete statistics never discard a valid profile balance', async () => {
+  for (const stats of [null, { today_actual_cost: '0.0042' }]) {
+    const adapter = loadAdapter(async url => String(url).endsWith('/user/profile')
+      ? json({ code: 0, data: { balance: 1.2345 } })
+      : stats ? json({ code: 0, data: stats }) : json({ message: 'Not Found' }, 404));
+    const result = await adapter.getBalance(provider());
+    assert.equal(result.balance, 1.2345);
+    if (stats) {
+      assert.equal(result.accountStats.todayCost, 0.0042);
+      assert.equal(result.accountStats.todayRequests, null);
+    } else assert.equal(result.accountStats, undefined);
+  }
+});
+
+test('account authentication failures are not hidden by fallback endpoints', async () => {
+  const record = provider();
+  delete record.accountRefreshToken;
+  let calls = 0;
+  const adapter = loadAdapter(async () => {
+    calls += 1;
+    return json({ message: 'Expired' }, 401);
+  });
+  await assert.rejects(adapter.getBalance(record), error => error.status === 401 && /重新连接账户/.test(error.message));
+  assert.equal(calls, 2); // Profile and supplementary statistics each run once.
 });
 
 test('capture separates refresh_token from the Bearer token and prefers auth_token', async () => {

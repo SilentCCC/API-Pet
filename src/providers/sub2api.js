@@ -1,4 +1,4 @@
-const { notConfigured } = require('./base');
+const { notConfigured, accountFetch } = require('./base');
 const pendingRefreshes = new WeakMap();
 
 function parseNumber(value) {
@@ -39,7 +39,7 @@ async function refreshAccessToken(context, signal) {
   if (!context.refreshToken) return false;
   const headers = { Accept: 'application/json', 'Content-Type': 'application/json', 'X-User-UI-Request': '1' };
   if (context.cookie) headers.Cookie = context.cookie;
-  const response = await fetch(context.refreshUrl, {
+  const response = await accountFetch(context.refreshUrl, {
     method: 'POST',
     headers,
     body: JSON.stringify({ refresh_token: context.refreshToken }),
@@ -73,7 +73,7 @@ async function refreshAccessToken(context, signal) {
 
 async function getJson(url, context, signal) {
   const sentToken = context.token;
-  let response = await fetch(url, { headers: context.headers, signal });
+  let response = await accountFetch(url, { headers: context.headers, signal });
   if (response.status === 401 && context.refreshToken) {
     // Balance and key imports may overlap; share token rotation for this account.
     if (String(context.provider.accountToken || '').trim().replace(/^Bearer\s+/i, '') === sentToken) {
@@ -86,12 +86,12 @@ async function getJson(url, context, signal) {
     context.token = String(context.provider.accountToken || '').trim().replace(/^Bearer\s+/i, '');
     context.refreshToken = String(context.provider.accountRefreshToken || '').trim();
     context.headers.Authorization = `Bearer ${context.token}`;
-    response = await fetch(url, { headers: context.headers, signal });
+    response = await accountFetch(url, { headers: context.headers, signal });
   }
   const text = await response.text();
   let body;
   try { body = JSON.parse(text); } catch { body = null; }
-  if (!response.ok || body?.success === false || (body?.code != null && body.code !== 0)) {
+  if (!response.ok || body == null || body?.success === false || (body?.code != null && body.code !== 0)) {
     const message = body?.message || body?.detail || body?.error?.message || text.slice(0, 200);
     const error = new Error(response.status === 401
       ? `Sub2API 登录凭据已过期，请重新连接账户: ${message}`
@@ -101,6 +101,24 @@ async function getJson(url, context, signal) {
     throw error;
   }
   return body?.data ?? body;
+}
+
+async function getProfile(provider, context, signal) {
+  let profileError;
+  try {
+    const profile = await getJson(apiUrl(provider, 'user/profile'), context, signal);
+    if (parseNumber((profile?.user ?? profile)?.balance) != null) return profile;
+    profileError = new Error('Sub2API /user/profile 响应中没有可识别的 balance 字段');
+  } catch (error) {
+    if (![404, 405].includes(error.status)) throw error;
+    profileError = error;
+  }
+  try {
+    return await getJson(apiUrl(provider, 'auth/me'), context, signal);
+  } catch (error) {
+    if ([404, 405].includes(error.status)) throw profileError;
+    throw error;
+  }
 }
 
 module.exports = {
@@ -117,7 +135,7 @@ module.exports = {
     const timer = setTimeout(() => controller.abort(), 15000);
     try {
       const context = requestContext(provider);
-      const profile = await getJson(profileUrl, context, controller.signal);
+      const profile = await getProfile(provider, context, controller.signal);
       return { profile };
     } finally {
       clearTimeout(timer);
@@ -170,27 +188,25 @@ module.exports = {
     try {
       const context = requestContext(provider);
       const [profile, stats] = await Promise.all([
-        provider._accountProfile || getJson(profileUrl, context, controller.signal),
-        getJson(statsUrl, context, controller.signal)
+        provider._accountProfile || getProfile(provider, context, controller.signal),
+        // Statistics are supplementary; a missing dashboard must not hide balance.
+        getJson(statsUrl, context, controller.signal).catch(() => null)
       ]);
       const user = profile?.user ?? profile;
       const balance = parseNumber(user?.balance);
       if (balance == null) throw new Error('Sub2API /user/profile 响应中没有可识别的 balance 字段');
       const todayCost = parseNumber(stats?.today_actual_cost);
       const todayRequests = parseNumber(stats?.today_requests);
-      if (todayCost == null || todayRequests == null) {
-        throw new Error('Sub2API 账户统计响应中缺少 today_actual_cost 或 today_requests');
-      }
       return {
         balance,
         remaining: null,
         currency: provider.currency || '$',
-        accountStats: {
+        ...(stats ? { accountStats: {
           todayCost,
           todayRequests,
           todayTokens: parseNumber(stats?.today_tokens),
           averageDurationMs: parseNumber(stats?.average_duration_ms)
-        }
+        } } : {})
       };
     } finally {
       clearTimeout(timer);

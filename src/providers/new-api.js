@@ -1,4 +1,4 @@
-const { notConfigured } = require('./base');
+const { notConfigured, accountFetch } = require('./base');
 
 const QUOTA_PER_DOLLAR = 500000;
 
@@ -127,7 +127,7 @@ async function refreshAccessToken(provider, origin, context, signal) {
   if (!context.cookie) return false;
   const headers = { Accept: 'application/json', Cookie: context.cookie, 'Cache-Control': 'no-cache, no-store' };
   if (context.session) headers['X-Auth-Session'] = context.session;
-  const response = await fetch(`${origin}/api/user/auth/refresh`, { method: 'POST', headers, signal });
+  const response = await accountFetch(`${origin}/api/user/auth/refresh`, { method: 'POST', headers, signal });
   context.cookie = updateCookieHeader(context.cookie, response);
   provider.accountCookie = context.cookie;
   if (context.cookie) context.headers.Cookie = context.cookie;
@@ -162,9 +162,9 @@ async function refreshAccessToken(provider, origin, context, signal) {
 }
 
 async function getJson(url, headers, signal, method = 'GET', onUnauthorized) {
-  let response = await fetch(url, { method, headers, signal });
+  let response = await accountFetch(url, { method, headers, signal });
   if (response.status === 401 && typeof onUnauthorized === 'function' && await onUnauthorized()) {
-    response = await fetch(url, { method, headers, signal });
+    response = await accountFetch(url, { method, headers, signal });
   }
   const text = await response.text();
   let body;
@@ -259,10 +259,16 @@ module.exports = {
         const items = Array.isArray(list) ? list : list?.items;
         if (!Array.isArray(items)) throw new Error('New API 令牌列表响应格式无效');
         for (const item of items) {
-          if (item?.id == null) continue;
-          // New API exposes the key reveal action as POST, even though the list is read with GET.
-          const detail = await getJson(`${origin}/api/token/${encodeURIComponent(item.id)}/key`, request.headers, controller.signal, 'POST', request.refresh);
-          const rawKey = String(detail?.key || '').trim();
+          if (item?.status != null && Number(item.status) !== 1) continue;
+          // Compatible sites may return the complete key in the list. The
+          // upstream format still needs the separate reveal request.
+          let rawKey = String(item?.key || '').trim();
+          if (/\*{3,}/.test(rawKey)) rawKey = '';
+          if (!rawKey && item?.id != null) {
+            const detail = await getJson(`${origin}/api/token/${encodeURIComponent(item.id)}/key`, request.headers, controller.signal, 'POST', request.refresh);
+            rawKey = String(detail?.key || '').trim();
+          }
+          if (/\*{3,}/.test(rawKey)) throw new Error('New API 返回了脱敏的 API Key，请在站点复制完整令牌后手动填写');
           if (rawKey) keys.push({ key: /^sk-/i.test(rawKey) ? rawKey : `sk-${rawKey}`, name: String(item?.name || item?.remark || '').trim() });
         }
         if (items.length < 100) break;

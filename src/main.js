@@ -1,9 +1,10 @@
-const { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, shell, screen } = require('electron');
+const { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, clipboard, shell, screen, dialog, net } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const crypto = require('crypto');
 const balanceAdapters = require('./providers');
+const { requestImage, imageData } = require('./image-generation');
 
 const PORT = 8787;
 let mainWindow;
@@ -18,10 +19,15 @@ const PET_CLOSED_TOP = 12;
 const PET_OPEN_TOP = 450;
 const PET_SIZE = { width: 155, height: 190 };
 const CLOSED_WINDOW_SIZE = { width: 190, height: 220 };
-const OPEN_WINDOW_SIZE = { width: 430, height: 650 };
+const OPEN_WINDOW_SIZE = { width: 490, height: 650 };
 const DEFAULT_PANEL_HEIGHT = 430;
 const MIN_PANEL_HEIGHT = 320;
 let panelHeight = DEFAULT_PANEL_HEIGHT;
+const DEFAULT_PANEL_WIDTH = 450;
+const MIN_PANEL_WIDTH = 400;
+const MAX_PANEL_WIDTH = 500;
+let panelWidth = DEFAULT_PANEL_WIDTH;
+function openWindowWidth() { return OPEN_WINDOW_SIZE.width + panelWidth - DEFAULT_PANEL_WIDTH; }
 function openPetTop() { return PET_OPEN_TOP + panelHeight - DEFAULT_PANEL_HEIGHT; }
 const gotSingleInstanceLock = app.requestSingleInstanceLock();
 
@@ -91,7 +97,7 @@ function setPanelWindowPosition(open) {
   const bounds = mainWindow.getBounds();
   const anchorX = bounds.x + PET_LEFT;
   const anchorY = bounds.y + (panelWindowOpen ? openPetTop() : PET_CLOSED_TOP);
-  const size = open ? { ...OPEN_WINDOW_SIZE, height: OPEN_WINDOW_SIZE.height + panelHeight - DEFAULT_PANEL_HEIGHT } : CLOSED_WINDOW_SIZE;
+  const size = open ? { width: openWindowWidth(), height: OPEN_WINDOW_SIZE.height + panelHeight - DEFAULT_PANEL_HEIGHT } : CLOSED_WINDOW_SIZE;
   const top = open ? openPetTop() : PET_CLOSED_TOP;
   panelWindowOpen = open;
   // Resize and move together so the pet keeps the same screen anchor while the bubble grows upward.
@@ -106,9 +112,18 @@ function resizePanelHeight(height) {
   const maxHeight = Math.max(MIN_PANEL_HEIGHT, Math.min(area.height - 220, anchorY - area.y - 20));
   panelHeight = Math.round(Math.min(Math.max(height, MIN_PANEL_HEIGHT), maxHeight));
   mainWindow.webContents.send('panel-height', panelHeight);
-  mainWindow.setBounds({ x: bounds.x, y: anchorY - openPetTop(), width: OPEN_WINDOW_SIZE.width,
+  mainWindow.setBounds({ x: bounds.x, y: anchorY - openPetTop(), width: openWindowWidth(),
     height: OPEN_WINDOW_SIZE.height + panelHeight - DEFAULT_PANEL_HEIGHT }, false);
   return panelHeight;
+}
+function resizePanelWidth(width) {
+  if (!panelWindowOpen || !mainWindow || mainWindow.isDestroyed() || !Number.isFinite(width)) return panelWidth;
+  panelWidth = Math.round(Math.min(Math.max(width, MIN_PANEL_WIDTH), MAX_PANEL_WIDTH));
+  const bounds = mainWindow.getBounds();
+  mainWindow.setBounds({ ...bounds, width: openWindowWidth() }, false);
+  clampWindowToDisplay();
+  mainWindow.webContents.send('panel-width', panelWidth);
+  return panelWidth;
 }
 
 function ensureMainWindowVisible() {
@@ -274,7 +289,7 @@ function normalizeProvider(provider) {
     remainingPath: provider.remainingPath || '',
     currency: provider.currency || '$',
     dailyStats: normalizeDailyStats(provider.dailyStats),
-    accountStats: provider.accountStats && typeof provider.accountStats === 'object' ? { ...provider.accountStats } : null,
+    accountStats: provider.balanceAdapter !== 'none' && provider.accountStats && typeof provider.accountStats === 'object' ? { ...provider.accountStats } : null,
     balance: {
       balance: null,
       remaining: null,
@@ -284,7 +299,8 @@ function normalizeProvider(provider) {
       error: '',
       updatedAt: '',
       configured: false,
-      ...(provider.balance || {})
+      ...(provider.balance || {}),
+      ...(provider.balanceAdapter === 'none' ? { balance: null, remaining: null, status: 'disabled', apiStatus: 'disabled', error: '', updatedAt: '', configured: false } : {})
     }
   };
 }
@@ -308,15 +324,24 @@ function allModels() {
   state.providers.forEach(p => providerModels(p).forEach(id => ids.add(id)));
   return [...ids].sort().map(id => ({ id, object: 'model', owned_by: 'api-pet' }));
 }
+function modelFetch(url, options = {}) {
+  if (typeof process !== 'undefined' && process.versions?.electron && net?.fetch) {
+    // Follow the system proxy like account requests, without shared browser cookies.
+    return net.fetch(url, { ...options, credentials: 'omit', bypassCustomProtocolHandlers: true });
+  }
+  return fetch(url, options);
+}
 async function fetchModels(provider, apiKeyOverride = '') {
   const apiKey = String(apiKeyOverride || selectProviderApiKey(provider)).trim();
   if (!apiKey) throw new Error('该站点没有可用的 API Key');
+  if (/\*{3,}/.test(apiKey)) throw new Error('API Key 是带星号的脱敏文本，请导入或粘贴完整令牌');
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 15000);
   try {
     let lastError;
     for (const base of providerBaseUrls(provider)) {
-      const res = await fetch(`${base}/models`, {
+      const url = `${base}/models`;
+      const res = await modelFetch(url, {
         headers: { Authorization: `Bearer ${apiKey}`, Accept: 'application/json' }, signal: controller.signal
       });
       const text = await res.text();
@@ -324,7 +349,10 @@ async function fetchModels(provider, apiKeyOverride = '') {
       if (res.ok && Array.isArray(body.data)) {
         return body.data.map(x => typeof x === 'string' ? x : x.id).filter(Boolean);
       }
-      lastError = new Error(`${res.status} ${res.statusText}: ${body?.error?.message || text.slice(0, 200)}`);
+      const isHtml = /^\s*(?:<!doctype\s+html|<html\b)/i.test(text);
+      const detail = isHtml ? '返回了 HTML 网页，请检查请求地址是否为 API 地址' : body?.error?.message || body?.message || text.slice(0, 200);
+      lastError = new Error(`${url}: ${res.status} ${res.statusText}: ${detail}`);
+      if (res.status === 401 || res.status === 403) throw lastError;
     }
     throw lastError || new Error('无法获取模型列表');
   } finally { clearTimeout(timer); }
@@ -364,6 +392,7 @@ function getProviderAdapter(provider) {
 async function queryProviderBalance(id) {
   const provider = state.providers.find(p => p.id === id);
   if (!provider) throw new Error('Provider not found');
+  if (provider.balanceAdapter === 'none') return safeState();
   activeBalanceQueries += 1;
   try {
     selectProviderApiKey(provider);
@@ -416,7 +445,9 @@ async function queryProviderBalance(id) {
   }
 }
 async function refreshAllBalances() {
-  for (const provider of state.providers) await queryProviderBalance(provider.id);
+  for (const provider of state.providers) {
+    if (provider.balanceAdapter !== 'none') await queryProviderBalance(provider.id);
+  }
   return safeState();
 }
 let balanceTimer;
@@ -622,7 +653,7 @@ async function readSub2apiCredentials(loginWindow, origin) {
   return { accountToken: cleanSessionToken(accountToken), accountRefreshToken, accountCookie, accountUserId: cleanAccountUserId(accountUserId), accountSession: cleanSessionToken(accountSession) };
 }
 function accountAdapterCandidates(provider) {
-  const ids = [provider?.balanceAdapter, 'new-api', 'sub2api'];
+  const ids = [provider?.balanceAdapter, 'new-api', 'sub2api', 'aihub'];
   const candidates = [];
   for (const id of ids) {
     if (!id || candidates.some(item => item.id === id)) continue;
@@ -662,7 +693,7 @@ ipcMain.handle('connect-provider-account', async (_e, input) => {
   const provider = isDraft ? normalizeProvider(input.provider) : state.providers.find(item => item.id === id);
   if (!provider) return { ok: false, error: 'Provider not found', state: safeState() };
   const adapter = getProviderAdapter(provider);
-  if (!['sub2api', 'new-api'].includes(provider.balanceAdapter)) return { ok: false, error: '当前站点类型不支持账户登录', state: safeState() };
+  if (!['sub2api', 'new-api', 'aihub'].includes(provider.balanceAdapter)) return { ok: false, error: '当前站点类型不支持账户登录', state: safeState() };
   const loginUrl = cleanBaseUrl(typeof input === 'object' ? input?.loginUrl : '') || provider.loginUrl;
   const origin = sub2apiOrigin({ ...provider, loginUrl });
   if (!origin) return { ok: false, error: '登录地址无效', state: safeState() };
@@ -767,7 +798,19 @@ function makeWindow() {
   mainWindow.webContents.on('render-process-gone', (_event, details) => console.error('API Pet renderer exited:', details));
   mainWindow.webContents.on('unresponsive', () => console.error('API Pet renderer became unresponsive'));
   mainWindow.on('closed', () => { mainWindow = null; });
-  mainWindow.webContents.on('context-menu', () => buildAppMenu().popup({ window: mainWindow }));
+  mainWindow.webContents.on('context-menu', async (_event, params) => {
+    const window = mainWindow;
+    if (!window || window.isDestroyed()) return;
+    if (params.mediaType === 'image') {
+      try {
+        const x = Number(params.x) || 0;
+        const y = Number(params.y) || 0;
+        const generated = await window.webContents.executeJavaScript(`Boolean(document.elementFromPoint(${x}, ${y})?.matches('.generated-image img, .image-viewer img'))`);
+        if (generated) return;
+      } catch { return; }
+    }
+    if (!window.isDestroyed()) buildAppMenu().popup({ window });
+  });
 }
 function authOk(req) {
   const auth = req.headers.authorization || '';
@@ -935,7 +978,7 @@ ipcMain.handle('import-provider-tokens', async (_e, id) => {
   const input = id && typeof id === 'object' ? id : null;
   const provider = input?.provider ? normalizeProvider(input.provider) : state.providers.find(item => item.id === String(id || ''));
   if (!provider) return { ok: false, error: 'Provider not found' };
-  if (!['sub2api', 'new-api'].includes(provider.balanceAdapter)) return { ok: false, error: '当前站点类型暂不支持令牌导入' };
+  if (!['sub2api', 'new-api', 'aihub'].includes(provider.balanceAdapter)) return { ok: false, error: '当前站点类型暂不支持令牌导入' };
   try {
     const tokens = await getProviderAdapter(provider).getApiKeys(provider);
     return { ok: true, tokens, credentials: {
@@ -955,6 +998,79 @@ ipcMain.handle('chat-request', async (_e, input) => {
   try { return { ok: true, payload: await directChatRequest(input) }; }
   catch (error) { return { ok: false, error: String(error?.message || error) }; }
 });
+ipcMain.handle('generate-images', async (_e, input = {}) => {
+  try {
+    let model = String(input.model || '').trim();
+    const providerId = String(input.providerId || '');
+    let provider;
+    if (providerId) {
+      provider = state.providers.find(item => item.id === providerId);
+      if (model === 'Pet model') model = String(input.targetModel || '').trim() || providerModels(provider || {})[0];
+    } else if (model === 'Pet model') {
+      model = resolveRequestedModel(model);
+      provider = state.providers.find(item => item.id === state.unifiedRoute?.providerId);
+    } else provider = findProviderForModel(model);
+    if (!provider || !model) throw new Error('请选择可用的站点、Key 和绘图模型');
+    const keyIndex = providerId && input.apiKeyIndex != null ? Number(input.apiKeyIndex) : null;
+    if (keyIndex == null && !providerModels(provider).includes(model)) throw new Error('站点没有所选模型');
+    if (keyIndex != null && (!Number.isInteger(keyIndex) || keyIndex < 0)) throw new Error('所选 Key 无效');
+    const apiKey = keyIndex == null ? selectProviderApiKey(provider) : provider.apiKeys?.[keyIndex]?.key;
+    if (!apiKey) throw new Error('所选 Key 无效');
+    const count = /^sensenova-u1\.5-lite$/i.test(model.split('/').pop()) ? 1 : Math.min(5, Math.max(1, Math.floor(Number(input.count) || 1)));
+    const bases = providerBaseUrls(provider);
+    const results = await Promise.all(Array.from({ length: count }, async () => {
+      const startedAt = Date.now();
+      recordProviderRequest(provider);
+      mainWindow?.webContents.send('gateway-status', { status: 'requesting', model, provider: provider.name });
+      try {
+        const image = await requestImage({ bases, apiKey, options: { ...input, model } });
+        recordProviderResult(provider, startedAt, true);
+        mainWindow?.webContents.send('gateway-status', { status: 'success', model, provider: provider.name });
+        // Keep a local copy in the chat so expiring URLs remain viewable and saveable.
+        try {
+          const data = await imageData(image.url);
+          image.url = `data:${data.mimeType};base64,${data.bytes.toString('base64')}`;
+        } catch (error) { image.warning = `图片已生成，下载失败，可稍后点击保存重试：${error.message}`; }
+        return { image };
+      } catch (error) {
+        recordProviderResult(provider, startedAt, false);
+        mainWindow?.webContents.send('gateway-status', { status: 'error', model, provider: provider.name });
+        return { error: error.message || '绘图失败' };
+      } finally { persist(); }
+    }));
+    const images = results.flatMap(result => result.image ? [result.image] : []);
+    const errors = results.flatMap(result => result.error ? [result.error] : []);
+    return { ok: images.length > 0, images, errors, error: errors.join('；') };
+  } catch (error) { return { ok: false, error: error.message || '绘图失败' }; }
+});
+ipcMain.handle('save-generated-image', async (_e, url) => {
+  try {
+    const data = await imageData(url);
+    const extension = data.mimeType.split('/')[1].replace('jpeg', 'jpg');
+    const result = await dialog.showSaveDialog(mainWindow, { title: '保存生成图片', defaultPath: `API-Pet-${Date.now()}.${extension}`, filters: [{ name: '图片', extensions: [extension] }] });
+    if (result.canceled || !result.filePath) return { ok: true, canceled: true };
+    await fs.promises.writeFile(result.filePath, data.bytes);
+    return { ok: true };
+  } catch (error) { return { ok: false, error: error.message || '保存失败' }; }
+});
+ipcMain.handle('show-generated-image-menu', (event, url) => new Promise(resolve => {
+  let selected = false;
+  const menu = Menu.buildFromTemplate([{
+    label: '复制',
+    click: async () => {
+      selected = true;
+      try {
+        const data = await imageData(url);
+        const image = nativeImage.createFromBuffer(data.bytes);
+        if (image.isEmpty()) throw new Error('图片解码失败');
+        clipboard.writeImage(image);
+        resolve({ ok: true, copied: true });
+      } catch (error) { resolve({ ok: false, error: error.message || '复制失败' }); }
+    }
+  }]);
+  menu.popup({ window: BrowserWindow.fromWebContents(event.sender) || mainWindow,
+    callback: () => { if (!selected) resolve({ ok: true, canceled: true }); } });
+}));
 ipcMain.handle('save-provider', (_e, input) => {
   const existing = input.id ? state.providers.find(p => p.id === input.id) : null;
   const requestUrl = Object.prototype.hasOwnProperty.call(input, 'requestUrl') ? cleanBaseUrl(input.requestUrl) : (existing?.requestUrl || '');
@@ -966,7 +1082,7 @@ ipcMain.handle('save-provider', (_e, input) => {
   const idx = state.providers.findIndex(p => p.id === record.id);
   if (idx >= 0) {
     record.models = state.providers[idx].models || [];
-    record.balance = { ...(state.providers[idx].balance || record.balance), currency: record.currency };
+    if (selectedAdapter !== 'none') record.balance = { ...(state.providers[idx].balance || record.balance), currency: record.currency };
     state.providers[idx] = { ...state.providers[idx], ...record };
   } else state.providers.push(record);
   persist(); return safeState();
@@ -976,9 +1092,10 @@ ipcMain.handle('test-provider', (_e, id) => testProvider(id));
 ipcMain.handle('move-provider', (_e, input) => {
   const direction = input?.direction === 'up' ? -1 : input?.direction === 'down' ? 1 : 0;
   const index = state.providers.findIndex(provider => provider.id === input?.id);
-  const target = index + direction;
-  if (!direction || index < 0 || target < 0 || target >= state.providers.length) return safeState();
-  [state.providers[index], state.providers[target]] = [state.providers[target], state.providers[index]];
+  const target = Number.isInteger(input?.targetIndex) ? input.targetIndex : direction ? index + direction : -1;
+  if (index < 0 || target < 0 || target >= state.providers.length || target === index) return safeState();
+  const [provider] = state.providers.splice(index, 1);
+  state.providers.splice(target, 0, provider);
   persist();
   return safeState();
 });
@@ -1013,3 +1130,4 @@ ipcMain.handle('set-panel-open', (_e, open) => {
   ).then(() => true).catch(() => false);
 });
 ipcMain.handle('resize-panel-height', (_e, height) => resizePanelHeight(height));
+ipcMain.handle('resize-panel-width', (_e, width) => resizePanelWidth(width));

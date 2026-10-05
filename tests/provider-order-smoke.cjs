@@ -21,7 +21,10 @@ const state = {
 
 const source = fs.readFileSync(path.join(__dirname, '../src/main.js'), 'utf8');
 const handler = source.slice(source.indexOf("ipcMain.handle('move-provider'"), source.indexOf("ipcMain.handle('refresh-provider-balance'"));
-vm.runInNewContext(handler, { ipcMain, state, safeState: () => structuredClone(state), persist: () => { persisted += 1; } });
+vm.runInNewContext(handler, { ipcMain, state, safeState: () => structuredClone(state), persist: () => {
+  persisted += 1;
+  fs.writeFileSync(path.join(output, 'order.json'), JSON.stringify(state.providers.map(provider => provider.id)));
+} });
 ipcMain.handle('get-state', () => state);
 ipcMain.handle('get-balance-activity', () => false);
 ipcMain.handle('set-panel-open', () => true);
@@ -30,7 +33,7 @@ async function run() {
   await app.whenReady();
   window = new BrowserWindow({ show: false, width: 430, height: 650, webPreferences: {
     preload: path.join(__dirname, '../src/preload.js'), partition: `order-check-${Date.now()}`,
-    contextIsolation: true, nodeIntegration: false
+    contextIsolation: true, nodeIntegration: false, offscreen: true, backgroundThrottling: false
   } });
   await window.loadFile(path.join(__dirname, '../src/renderer/index.html'));
   const execute = code => window.webContents.executeJavaScript(code);
@@ -68,10 +71,88 @@ async function run() {
   await execute(`window.apiPet.moveProvider({id:'missing',direction:'up'})`);
   assert.equal(persisted, 2);
   assert.deepEqual(state.providers.map(provider => provider.id), ['0', '1', '2']);
+  const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
+  const point = async index => execute(`(() => {
+    const rect = document.querySelectorAll('#providers .provider-card')[${index}].getBoundingClientRect();
+    return { x: Math.round(rect.left + 30), y: Math.round(rect.top + rect.height / 2), bottom: Math.round(rect.bottom) };
+  })()`);
+  let pressed = false;
+  const mouse = (type, p) => {
+    if (type === 'mouseDown') pressed = true;
+    window.webContents.sendInputEvent({ type, x: p.x, y: p.y, button: 'left', clickCount: 1, modifiers: pressed ? ['leftButtonDown'] : [] });
+    if (type === 'mouseUp') pressed = false;
+  };
+  let start = await point(0);
+  let end = await point(2);
+  mouse('mouseMove', start);
+  mouse('mouseDown', start);
+  await delay(450);
+  assert.equal(await execute(`!!document.querySelector('.provider-sort-ghost')`), true, 'Long press starts dragging');
+  mouse('mouseMove', { ...end, y: end.bottom - 1 });
+  await delay(60);
+  fs.writeFileSync(path.join(output, 'dragging.png'), (await window.webContents.capturePage()).toPNG());
+  mouse('mouseUp', { ...end, y: end.bottom - 1 });
+  await delay(150);
+  assert.deepEqual(state.providers.map(provider => provider.id), ['1', '2', '0']);
+  assert.equal(persisted, 3, 'Cross-row drag saves once');
+  assert.equal(await execute(`document.querySelectorAll('#providers .provider-card-compact').length === 3 && !document.querySelector('.provider-sort-ghost')`), true);
+
+  start = await point(2);
+  end = await point(0);
+  mouse('mouseDown', start);
+  await delay(450);
+  mouse('mouseMove', { ...end, y: end.y - 12 });
+  await delay(60);
+  await execute(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
+  mouse('mouseUp', end);
+  assert.deepEqual(state.providers.map(provider => provider.id), ['1', '2', '0']);
+  assert.deepEqual(await execute(`Array.from(document.querySelectorAll('#providers .provider-card')).map(row => row.dataset.providerId)`), ['1', '2', '0'], 'Escape restores original visual order');
+  assert.equal(persisted, 3);
+
+  start = await point(0);
+  mouse('mouseDown', start);
+  mouse('mouseUp', start);
+  await delay(450);
+  assert.equal(await execute(`!!document.querySelector('.provider-sort-ghost')`), false, 'Short press does not drag');
+  mouse('mouseDown', start);
+  await delay(50);
+  mouse('mouseMove', { ...start, y: start.y + 15 });
+  await delay(450);
+  assert.equal(await execute(`!!document.querySelector('.provider-sort-ghost')`), false, 'Movement before long press cancels drag');
+  mouse('mouseUp', start);
+
+  start = await point(2);
+  end = await point(0);
+  mouse('mouseDown', start);
+  await delay(450);
+  mouse('mouseMove', { ...end, y: end.y - 12 });
+  await delay(60);
+  mouse('mouseUp', { ...end, y: end.y - 12 });
+  await delay(150);
+  assert.deepEqual(state.providers.map(provider => provider.id), ['0', '1', '2']);
+  assert.equal(persisted, 4, 'Dragging upward also saves once');
+  await execute(`window.apiPet.moveProvider({id:'0',targetIndex:-1}); window.apiPet.moveProvider({id:'0',targetIndex:99}); window.apiPet.moveProvider({id:'0',targetIndex:0})`);
+  assert.equal(persisted, 4, 'Invalid and unchanged drag positions do not persist');
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(output, 'order.json'), 'utf8')), ['0', '1', '2']);
+  for (let i = 3; i < 15; i++) state.providers.push({ ...state.providers[0], id: String(i), name: `Site ${i}` });
+  await execute(`(async () => { appState = await window.apiPet.getState(); render(); document.querySelector('.panel-scroll').scrollTop = 0; })()`);
+  start = await point(0);
+  end = await execute(`(() => { const rect = document.querySelector('.panel-scroll').getBoundingClientRect(); return {x: 70, y: Math.round(rect.bottom - 8)}; })()`);
+  mouse('mouseDown', start);
+  await delay(450);
+  mouse('mouseMove', end);
+  await delay(250);
+  assert.equal(await execute(`document.querySelector('.panel-scroll').scrollTop > 0`), true, 'Dragging at the panel edge scrolls the list');
+  await execute(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
+  mouse('mouseUp', end);
+  assert.equal(persisted, 4, 'Cancelling after autoscroll does not save');
+  state.providers.splice(3);
+  await execute(`(async () => { appState = await window.apiPet.getState(); render(); document.querySelector('.panel-scroll').scrollTop = 0; })()`);
   await execute(`document.querySelector('#toggleProviders').click()`);
   assert.equal(await execute(`document.querySelectorAll('.provider-reorder').length`), 0);
+  assert.equal(await execute(`document.querySelectorAll('.provider-sortable').length`), 0);
   fs.writeFileSync(path.join(output, 'result.json'), JSON.stringify({
-    passed: true, checks: ['boundary buttons', 'nonoverlapping layout', 'move down', 'move up', 'persist', 'stay collapsed', 'invalid moves', 'expanded mode'], rows
+    passed: true, checks: ['boundary buttons', 'nonoverlapping layout', 'move down', 'move up', 'persist', 'stay collapsed', 'invalid moves', 'long press drag down and up', 'Escape cancellation', 'short press and early movement', 'edge autoscroll', 'expanded mode'], rows
   }, null, 2));
 }
 

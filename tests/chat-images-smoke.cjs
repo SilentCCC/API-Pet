@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, nativeImage } = require('electron');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
@@ -10,6 +10,31 @@ app.setPath('userData', path.join(output, 'browser'));
 let window;
 let failNext = false;
 const requests = [];
+const drawingRequests = [];
+const savedImages = [];
+const copiedImages = [];
+let cancelCopy = false;
+let failCopy = false;
+const copyContext = vm.createContext({
+  ipcMain, BrowserWindow, mainWindow: null, nativeImage,
+  imageData: require('../src/image-generation').imageData,
+  clipboard: { writeImage(image) {
+    if (failCopy) throw new Error('Clipboard test failure');
+    copiedImages.push(image);
+  } },
+  Menu: { buildFromTemplate(items) {
+    assert.deepEqual(Array.from(items, item => item.label), ['复制']);
+    return { popup(options) {
+      assert.ok(options.window instanceof BrowserWindow);
+      if (!cancelCopy) items[0].click();
+      // Closing the menu must not cancel the pending async image copy.
+      options.callback();
+    } };
+  } }
+});
+const copySource = fs.readFileSync(path.join(__dirname, '../src/main.js'), 'utf8');
+vm.runInContext(copySource.slice(copySource.indexOf("ipcMain.handle('show-generated-image-menu'"), copySource.indexOf("ipcMain.handle('save-provider'")), copyContext);
+let drawingFailure = false;
 const provider = { id: 'test', name: 'Test', models: ['test-model'], status: 'online', balance: {}, apiKeys: [{ key: 'test-only' }] };
 const state = { unifiedKey: 'test-only', routes: {}, unifiedRoute: {}, balanceSettings: {}, providers: [provider] };
 const source = fs.readFileSync(path.join(__dirname, '../src/main.js'), 'utf8');
@@ -36,6 +61,14 @@ ipcMain.handle('chat-request', async (_event, input) => {
   catch (error) { return { ok: false, error: error.message }; }
 });
 const pixels = fs.readFileSync(path.join(__dirname, '../src/renderer/assets/pet-normal.png')).toString('base64');
+ipcMain.handle('generate-images', async (_event, input) => {
+  drawingRequests.push(input);
+  await new Promise(resolve => setTimeout(resolve, 80));
+  return drawingFailure ? { ok: false, error: 'Drawing test failure' } : {
+    ok: true, images: [{ url: `data:image/png;base64,${pixels}` }], errors: ['Partial test failure']
+  };
+});
+ipcMain.handle('save-generated-image', (_event, url) => { savedImages.push(url); return { ok: true }; });
 async function run() {
   await app.whenReady();
   window = new BrowserWindow({ show: false, width: 430, height: 650, webPreferences: {
@@ -81,18 +114,21 @@ async function run() {
   assert.equal(await execute(`$('chatAttachments').children.length`), 2);
   assert.equal(await execute(`chatPanel.classList.contains('drag-over')`), false);
   await execute(`$('chatMode').value = 'image'; $('chatMode').dispatchEvent(new Event('change'));`);
-  assert.equal(await execute(`$('sendChat').disabled`), true);
+  assert.equal(await execute(`$('sendChat').disabled`), false);
+  assert.equal(await execute(`$('drawingParameters').classList.contains('hidden')`), false);
   assert.equal(await execute(`$('chatAttachments').children.length`), 2);
   await execute(`$('chatMode').value = 'text'; $('chatMode').dispatchEvent(new Event('change')); document.querySelector('#chatAttachments button').click();`);
   assert.equal(await execute(`$('chatAttachments').children.length`), 1);
   const layout = await execute(`(() => {
-    const nodes = [$('chatMode'), $('chatInput'), $('addChatImage'), $('sendChat')];
+    const nodes = [$('chatMode'), $('chatInput'), $('addChatImage'), $('sendChat'), $('clearChat')];
     return nodes.map(node => { const r = node.getBoundingClientRect(); return { left: r.left, right: r.right, top: r.top, bottom: r.bottom }; });
   })()`);
   assert.equal(layout[0].right - layout[0].left, 54);
   assert.equal(layout[1].bottom - layout[1].top, 38);
   assert.ok(layout[0].right <= layout[1].left && layout[1].right <= layout[3].left);
   assert.ok(layout[2].left >= layout[1].left && layout[2].right <= layout[1].right);
+  assert.ok(layout[3].right <= layout[4].left && layout[4].right <= 420);
+  assert.equal(layout[4].bottom - layout[4].top, 38);
   assert.ok(layout.every(rect => rect.bottom <= 440));
   await execute(`new Promise(resolve => setTimeout(resolve, 100))`);
   fs.writeFileSync(path.join(output, 'attachments.png'), (await window.webContents.capturePage()).toPNG());
@@ -102,6 +138,7 @@ async function run() {
   })()`);
   await submit('Describe this image');
   assert.equal(requests.length, 1);
+  assert.equal(await execute(`$('chatSite').disabled`), false);
   assert.ok(Array.isArray(requests[0].body.input));
   assert.equal(requests[0].body.input[0].content[1].type, 'input_image');
   assert.ok(requests[0].body.input[0].content[1].image_url.startsWith('data:image/png;base64,'));
@@ -122,8 +159,118 @@ async function run() {
   assert.equal(await execute(`$('chatInput').value`), 'Retry me');
   assert.equal(await execute(`$('chatAttachments').children.length`), 4);
   assert.equal(await execute(`$('sendChat').disabled`), false);
+  const historyCount = await execute('chatHistory.length');
+  await execute(`(() => {
+    $('chatMode').value = 'image'; $('chatMode').dispatchEvent(new Event('change'));
+    window.changeDrawing = (key, value) => { const field = document.querySelector('[data-drawing="' + key + '"]'); field.value = value; field.dispatchEvent(new Event('change', {bubbles:true})); };
+    changeDrawing('resolution', '2K'); changeDrawing('ratio', '16:9'); changeDrawing('quality', 'auto'); changeDrawing('count', '3');
+  })()`);
+  assert.equal(await execute(`drawingOptions.size`), '2048x1152');
+  assert.equal(await execute(`$('chatModelLabel').textContent.includes('图生图')`), true);
+  // Check the smallest supported panel with reference thumbnails and a full parameter grid.
+  const drawingLayout = await execute(`(() => {
+    document.documentElement.style.setProperty('--panel-height', '320px');
+    return ['chatPanel', 'drawingParameters', 'chatInput', 'chatMessages'].map(id => { const r = $(id).getBoundingClientRect(); return { id, top:r.top, bottom:r.bottom, height:r.height }; });
+  })()`);
+  fs.writeFileSync(path.join(output, 'drawing-layout.json'), JSON.stringify(drawingLayout, null, 2));
+  assert.ok(drawingLayout[2].bottom <= drawingLayout[0].bottom);
+  assert.ok(drawingLayout[1].height >= 30);
+  assert.ok(drawingLayout[3].height >= 35);
+  await execute(`new Promise(resolve => setTimeout(resolve, 100))`);
+  fs.writeFileSync(path.join(output, 'drawing-minimum.png'), (await window.webContents.capturePage()).toPNG());
+  await execute(`document.documentElement.style.setProperty('--panel-height', '430px'); $('chatInput').value = 'Draw a cat'; $('chatForm').requestSubmit();`);
+  assert.equal(await execute(`$('chatMode').disabled && document.querySelector('[data-drawing="resolution"]').disabled`), true);
+  assert.equal(await execute(`['chatSite', 'chatKey', 'chatModel'].every(id => $(id).disabled)`), true);
+  assert.equal(await execute(`$('clearChat').disabled`), true);
+  await execute(`(async () => { for (let i=0; i<100 && chatSending; i++) await new Promise(resolve => setTimeout(resolve,20)); })()`);
+  assert.equal(await execute(`$('chatSite').disabled || $('chatModel').disabled`), false);
+  await execute(`$('chatSite').value = 'test'; $('chatSite').dispatchEvent(new Event('change'));`);
+  assert.equal(await execute(`chatSiteSelection`), 'test');
+  assert.equal(await execute(`$('chatKey').disabled`), false);
+  await execute(`$('chatSite').value = ''; $('chatSite').dispatchEvent(new Event('change'));`);
+  assert.equal(drawingRequests.length, 1);
+  assert.equal(drawingRequests[0].referenceImages.length, 4);
+  assert.equal(drawingRequests[0].quality, 'auto');
+  assert.equal(drawingRequests[0].count, 3);
+  assert.equal(drawingRequests[0].size, '2048x1152');
+  assert.equal(await execute(`chatHistory.length`), historyCount);
+  assert.equal(await execute(`document.querySelectorAll('.generated-image').length`), 1);
+  assert.equal(await execute(`document.querySelector('.generation-warning').textContent.includes('Partial test failure')`), true);
+  await execute(`(async () => {
+    const event = new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2 });
+    document.querySelector('.generated-image img').dispatchEvent(event);
+    if (!event.defaultPrevented) throw new Error('Default image menu was not prevented');
+    for (let i=0; i<50 && !$('toast').textContent.includes('图片已复制'); i++) await new Promise(resolve => setTimeout(resolve,20));
+  })()`);
+  assert.equal(copiedImages.length, 1);
+  const originalImage = nativeImage.createFromBuffer(Buffer.from(pixels, 'base64'));
+  assert.deepEqual(copiedImages[0].getSize(), originalImage.getSize());
+  assert.deepEqual(copiedImages[0].toBitmap(), originalImage.toBitmap());
+  assert.equal(savedImages.length, 0, 'Copy does not require saving');
+  await execute(`document.querySelector('.generated-image img').click()`);
+  assert.equal(await execute(`document.querySelector('.image-viewer').open`), true);
+  await execute(`document.querySelector('.image-viewer img').dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2 }))`);
+  assert.equal(copiedImages.length, 2);
+  cancelCopy = true;
+  assert.equal((await execute(`window.apiPet.showGeneratedImageMenu(document.querySelector('.generated-image img').src)`)).canceled, true);
+  assert.equal(copiedImages.length, 2);
+  cancelCopy = false; failCopy = true;
+  await execute(`(async () => {
+    document.querySelector('.image-viewer img').dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true, button: 2 }));
+    for (let i=0; i<50 && !$('toast').textContent.includes('复制失败'); i++) await new Promise(resolve => setTimeout(resolve,20));
+    if (!$('toast').textContent.includes('Clipboard test failure')) throw new Error('Missing copy failure message');
+  })()`);
+  failCopy = false;
+  assert.equal((await execute(`window.apiPet.showGeneratedImageMenu('data:image/png;base64,YQ==')`)).ok, false, 'Undecodable images must fail');
+  assert.equal(copiedImages.length, 2);
+  await execute(`document.querySelector('.image-viewer button').click(); document.querySelector('.generated-image button').click();`);
+  assert.equal(savedImages.length, 1);
+  assert.equal(await execute(`$('chatModelLabel').textContent.includes('文生图')`), true);
+  drawingFailure = true;
+  await execute(`(async () => { await addChatImages([testImage()]); $('chatInput').value = 'Retry drawing'; $('chatForm').requestSubmit(); for (let i=0; i<100 && chatSending; i++) await new Promise(resolve => setTimeout(resolve,20)); })()`);
+  assert.equal(await execute(`$('chatInput').value`), 'Retry drawing');
+  assert.equal(await execute(`chatImages.length`), 1);
+  assert.equal(await execute(`$('sendChat').disabled`), false);
+  assert.equal(await execute(`$('chatSite').disabled || $('chatModel').disabled`), false);
+  await execute(`(() => {
+    appState.providers[0].models = ['gemini-3-pro-image']; chatModelSelection = 'gemini-3-pro-image'; updateChatModelLabel();
+    changeDrawing('resolution', 'auto'); changeDrawing('ratio', '9:16');
+  })()`);
+  assert.equal(await execute(`drawingOptions.ratio`), '9:16');
+  assert.equal(await execute(`document.querySelector('[data-drawing="quality"]') === null`), true);
+  await execute(`appState.providers[0].models = ['seedream-v5-pro']; chatModelSelection = 'seedream-v5-pro'; updateChatModelLabel();`);
+  assert.equal(await execute(`document.querySelector('[data-drawing="resolution"]').value`), '1K');
+  await execute(`$('chatMode').value = 'text'; $('chatMode').dispatchEvent(new Event('change'));`);
+  assert.equal(await execute(`$('drawingParameters').classList.contains('hidden')`), true);
+  await execute(`$('chatInput').value = 'Unsent draft'; document.querySelector('.generated-image img').click(); $('clearChat').click()`);
+  assert.equal(await execute(`chatHistory.length`), 0);
+  assert.equal(await execute(`document.querySelectorAll('.chat-message, .image-viewer').length`), 0);
+  assert.equal(await execute(`document.querySelectorAll('.chat-empty').length`), 1);
+  assert.equal(await execute(`$('chatInput').value`), 'Unsent draft');
+  assert.equal(await execute(`chatImages.length`), 1);
+  await submit('New image conversation');
+  assert.equal(requests.at(-1).body.messages.length, 1);
+  assert.equal(requests.at(-1).body.messages[0].content[0].text, 'New image conversation');
+  await execute(`$('clearChat').click(); appState.unifiedRoute.format = 'responses';`);
+  await execute(`(async () => {
+    $('chatInput').value = 'New text conversation'; $('chatForm').requestSubmit();
+    if (!$('clearChat').disabled) throw new Error('Clear must be disabled during text request');
+    clearChatContext();
+    if (chatHistory.length !== 1) throw new Error('Active request context was cleared');
+    for (let i=0; i<100 && chatSending; i++) await new Promise(resolve => setTimeout(resolve,20));
+  })()`);
+  assert.equal(requests.at(-1).body.input, '用户：New text conversation');
+  assert.equal(await execute(`$('clearChat').disabled`), false);
+  assert.equal(await execute(`chatHistory.length`), 2);
+  await execute(`$('clearChat').click(); $('clearChat').click()`);
+  assert.equal(await execute(`chatHistory.length`), 0);
+  assert.equal(await execute(`document.querySelectorAll('.chat-empty').length`), 1);
+  window.webContents.invalidate();
+  await new Promise(resolve => setTimeout(resolve, 100));
+  fs.writeFileSync(path.join(output, 'clear-button.png'), (await window.webContents.capturePage()).toPNG());
   fs.writeFileSync(path.join(output, 'result.json'), JSON.stringify({ passed: true,
-    checks: ['plus opens file selection', 'file selection', 'drag and drop', 'preview decode', 'remove', 'mode preserves images', 'layout', 'responses image and history', 'chat completions image only', 'invalid and oversized files', 'four image limit', 'failure restores draft'] }, null, 2));
+    contextChecks: ['clear history and generated previews', 'keep unsent draft', 'new requests exclude old text and images', 'request lock and restore', 'button layout'],
+    checks: ['plus opens file selection', 'file selection', 'drag and drop', 'preview decode', 'remove', 'mode preserves images', 'layout', 'responses image and history', 'chat completions image only', 'invalid and oversized files', 'four image limit', 'failure restores draft', 'drawing parameters and size changes', 'minimum height drawing layout', 'drawing request lock', 'generated preview and save', 'right click bitmap copy in preview and viewer', 'copy cancellation and failure', 'partial failure', 'drawing failure restores draft', 'model parameter changes', 'text mode hides parameters'] }, null, 2));
 }
 const timeout = setTimeout(() => {
   fs.writeFileSync(path.join(output, 'result.json'), JSON.stringify({ passed: false, error: 'timeout' })); app.exit(1);

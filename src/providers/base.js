@@ -19,4 +19,4 @@ function accountFetch(url, options = {}) {
   return fetch(url, options);
 }
 
-module.exports = { BalanceAdapterNotConfiguredError, notConfigured, accountFetch };
+module.exports = { BalanceAdapterNotConfiguredError, notConfigured, accountFetch, ...require('../provider-currency') };

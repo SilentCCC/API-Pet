@@ -137,7 +137,8 @@ test('drawing IPC selects chat Key, batches partial results and saves without an
   let generation = 0, saved, canceled = false;
   const ctx = vm.createContext({
     ipcMain: { handle: (name, fn) => handlers[name] = fn }, state: { providers: [provider], unifiedRoute: { providerId: 'test' } }, mainWindow: null,
-    providerModels: p => p.models, findProviderForModel: () => provider, resolveRequestedModel: () => 'gpt-image-2', selectProviderApiKey: () => 'first', providerBaseUrls: () => ['https://example.invalid/v1'],
+    providerModels: p => p.models, findProviderForModel: () => provider, resolveRequestedModel: () => ctx.state.unifiedRoute.model || 'gpt-image-2', selectProviderApiKey: () => 'first',
+    unifiedRouteKey: p => p.apiKeys.find(item=>item.key===ctx.state.unifiedRoute.apiKey)?.key || '', providerBaseUrls: () => ['https://example.invalid/v1'],
     recordProviderRequest() {}, recordProviderResult: (_p, _t, success) => metrics.push(success), persist() {},
     requestImage: async input => { calls.push(input); if (++generation === 2) throw new Error('one failed'); return { url: reference }; },
     imageData: async () => ({ bytes, mimeType: 'image/png' }),
@@ -154,4 +155,12 @@ test('drawing IPC selects chat Key, batches partial results and saves without an
   canceled = true;
   assert.equal((await handlers['save-generated-image'](null, reference)).canceled, true);
   assert.equal((await handlers['generate-images'](null, { ...defaults, providerId: 'test', apiKeyIndex: 9 })).ok, false);
+  const actualPetModel = await handlers['generate-images'](null, { ...defaults, model: 'Pet model', providerId: 'test', apiKeyIndex: 1 });
+  assert.equal(actualPetModel.ok, true);
+  assert.equal(calls.at(-1).options.model, 'Pet model', 'Explicit site models are never rewritten as a gateway alias');
+  ctx.state.unifiedRoute={providerId:'test',apiKey:'second',model:'key-only-image',models:['key-only-image']};
+  const routedImage=await handlers['generate-images'](null,{...defaults,model:'Pet model'});
+  assert.equal(routedImage.ok,true);
+  assert.equal(calls.at(-1).apiKey,'second');
+  assert.equal(calls.at(-1).options.model,'key-only-image');
 });

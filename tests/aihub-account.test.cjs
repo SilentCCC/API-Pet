@@ -26,7 +26,7 @@ function missingAdapter(id) {
   return { id, label: id, detect: async () => { throw Object.assign(new Error('404 page not found'), { status: 404 }); } };
 }
 function loadMain(adapters) {
-  const context = vm.createContext({ URL, balanceAdapters: adapters });
+  const context = vm.createContext({ URL, balanceAdapters: adapters, ...require('../src/provider-currency') });
   vm.runInContext(source.slice(source.indexOf('function isJwt('), source.indexOf("ipcMain.handle('connect-provider-account'")), context);
   return context;
 }
@@ -213,4 +213,22 @@ test('connecting saves the detected adapter and allows balance refresh and impor
   assert.equal(draftImported.tokens[0].name, '文本');
   assert.equal(persisted, 2);
   assert.equal(closed, 2);
+  context.state.providers[0] = { ...record(), balanceAdapter: 'none', balance: { balance: null } };
+  const edited = await handlers['connect-provider-account'](null, {
+    id: record().id, provider: { ...record(), balanceAdapter: 'aihub' }
+  });
+  await new Promise(setImmediate);
+  assert.equal(edited.ok, true, 'Editing a saved-only site uses the selected draft adapter');
+  assert.equal(edited.provider.balanceAdapter, 'aihub');
+  assert.equal(edited.provider.balance.balance, 1.234567);
+  assert.equal(context.state.providers[0].balanceAdapter, 'none', 'Draft connection does not save the selected type');
+  assert.equal(context.state.providers[0].balance.balance, null);
+  assert.equal(persisted, 2);
+  const editedImport = await handlers['import-provider-tokens'](null, { provider: { ...record(), ...edited.provider } });
+  assert.equal(editedImport.ok, true);
+  assert.equal(persisted, 2);
+  const unsupported = await handlers['connect-provider-account'](null, { id: record().id, provider: { ...record(), balanceAdapter: 'none' } });
+  assert.equal(unsupported.ok, false);
+  assert.match(unsupported.error, /不支持账户登录/);
+  assert.equal(closed, 3, 'Unsupported draft does not open a login window');
 });

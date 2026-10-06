@@ -44,32 +44,18 @@ async function run() {
   })()`);
   const rows = await execute(`Array.from(document.querySelectorAll('.provider-card')).map(card => ({
     name: card.querySelector('.provider-compact-name').textContent,
-    up: !!card.querySelector('[data-direction="up"]'), down: !!card.querySelector('[data-direction="down"]'),
+    arrows: card.querySelectorAll('[data-direction]').length,
     overflow: card.scrollWidth > card.clientWidth,
     children: Array.from(card.children).map(child => ({left: child.getBoundingClientRect().left, right: child.getBoundingClientRect().right}))
   }))`);
-  assert.deepEqual(rows.map(row => [row.up, row.down]), [[false, true], [true, true], [true, false]]);
+  assert.deepEqual(rows.map(row => row.arrows), [0, 0, 0]);
   assert.ok(rows.every(row => !row.overflow));
   for (const row of rows) for (let i = 1; i < row.children.length; i++) assert.ok(row.children[i - 1].right <= row.children[i].left);
   fs.writeFileSync(path.join(output, 'collapsed.png'), (await window.webContents.capturePage()).toPNG());
 
-  await execute(`(async () => {
-    document.querySelector('.provider-card [data-direction="down"]').click();
-    for (let i = 0; i < 50 && document.querySelector('.provider-compact-name').textContent === 'Alpha'; i++) await new Promise(resolve => setTimeout(resolve, 20));
-  })()`);
-  assert.deepEqual(state.providers.map(provider => provider.id), ['1', '0', '2']);
-  assert.equal(persisted, 1);
   assert.equal(await execute(`document.querySelectorAll('.provider-card-compact').length`), 3);
-  await execute(`(async () => {
-    document.querySelectorAll('.provider-card')[1].querySelector('[data-direction="up"]').click();
-    for (let i = 0; i < 50 && document.querySelector('.provider-compact-name').textContent !== 'Alpha'; i++) await new Promise(resolve => setTimeout(resolve, 20));
-  })()`);
-  assert.deepEqual(state.providers.map(provider => provider.id), ['0', '1', '2']);
-  assert.equal(persisted, 2);
-  await execute(`window.apiPet.moveProvider({id:'0',direction:'up'})`);
-  await execute(`window.apiPet.moveProvider({id:'2',direction:'down'})`);
-  await execute(`window.apiPet.moveProvider({id:'missing',direction:'up'})`);
-  assert.equal(persisted, 2);
+  await execute(`window.apiPet.moveProvider({id:'missing',targetIndex:0}); window.apiPet.moveProvider({id:'0'})`);
+  assert.equal(persisted, 0);
   assert.deepEqual(state.providers.map(provider => provider.id), ['0', '1', '2']);
   const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
   const point = async index => execute(`(() => {
@@ -94,7 +80,7 @@ async function run() {
   mouse('mouseUp', { ...end, y: end.bottom - 1 });
   await delay(150);
   assert.deepEqual(state.providers.map(provider => provider.id), ['1', '2', '0']);
-  assert.equal(persisted, 3, 'Cross-row drag saves once');
+  assert.equal(persisted, 1, 'Cross-row drag saves once');
   assert.equal(await execute(`document.querySelectorAll('#providers .provider-card-compact').length === 3 && !document.querySelector('.provider-sort-ghost')`), true);
 
   start = await point(2);
@@ -107,7 +93,7 @@ async function run() {
   mouse('mouseUp', end);
   assert.deepEqual(state.providers.map(provider => provider.id), ['1', '2', '0']);
   assert.deepEqual(await execute(`Array.from(document.querySelectorAll('#providers .provider-card')).map(row => row.dataset.providerId)`), ['1', '2', '0'], 'Escape restores original visual order');
-  assert.equal(persisted, 3);
+  assert.equal(persisted, 1);
 
   start = await point(0);
   mouse('mouseDown', start);
@@ -130,9 +116,9 @@ async function run() {
   mouse('mouseUp', { ...end, y: end.y - 12 });
   await delay(150);
   assert.deepEqual(state.providers.map(provider => provider.id), ['0', '1', '2']);
-  assert.equal(persisted, 4, 'Dragging upward also saves once');
+  assert.equal(persisted, 2, 'Dragging upward also saves once');
   await execute(`window.apiPet.moveProvider({id:'0',targetIndex:-1}); window.apiPet.moveProvider({id:'0',targetIndex:99}); window.apiPet.moveProvider({id:'0',targetIndex:0})`);
-  assert.equal(persisted, 4, 'Invalid and unchanged drag positions do not persist');
+  assert.equal(persisted, 2, 'Invalid and unchanged drag positions do not persist');
   assert.deepEqual(JSON.parse(fs.readFileSync(path.join(output, 'order.json'), 'utf8')), ['0', '1', '2']);
   for (let i = 3; i < 15; i++) state.providers.push({ ...state.providers[0], id: String(i), name: `Site ${i}` });
   await execute(`(async () => { appState = await window.apiPet.getState(); render(); document.querySelector('.panel-scroll').scrollTop = 0; })()`);
@@ -145,14 +131,14 @@ async function run() {
   assert.equal(await execute(`document.querySelector('.panel-scroll').scrollTop > 0`), true, 'Dragging at the panel edge scrolls the list');
   await execute(`document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', bubbles: true }))`);
   mouse('mouseUp', end);
-  assert.equal(persisted, 4, 'Cancelling after autoscroll does not save');
+  assert.equal(persisted, 2, 'Cancelling after autoscroll does not save');
   state.providers.splice(3);
   await execute(`(async () => { appState = await window.apiPet.getState(); render(); document.querySelector('.panel-scroll').scrollTop = 0; })()`);
   await execute(`document.querySelector('#toggleProviders').click()`);
   assert.equal(await execute(`document.querySelectorAll('.provider-reorder').length`), 0);
   assert.equal(await execute(`document.querySelectorAll('.provider-sortable').length`), 0);
   fs.writeFileSync(path.join(output, 'result.json'), JSON.stringify({
-    passed: true, checks: ['boundary buttons', 'nonoverlapping layout', 'move down', 'move up', 'persist', 'stay collapsed', 'invalid moves', 'long press drag down and up', 'Escape cancellation', 'short press and early movement', 'edge autoscroll', 'expanded mode'], rows
+    passed: true, checks: ['arrow controls removed', 'nonoverlapping layout', 'persist', 'stay collapsed', 'invalid moves', 'long press drag down and up', 'Escape cancellation', 'short press and early movement', 'edge autoscroll', 'expanded mode'], rows
   }, null, 2));
 }
 

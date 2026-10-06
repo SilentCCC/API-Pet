@@ -1,4 +1,5 @@
 const { modelKind, normalizeImageSizeSelection } = require('./renderer/image-config');
+const { detectMime } = require('./image-format');
 const TIMEOUT_MS = 180000;
 const MAX_IMAGE_BYTES = 40 * 1024 * 1024;
 
@@ -164,11 +165,7 @@ async function requestImage({ bases, apiKey, options, fetchImpl = fetch, timeout
 }
 
 function imageMime(bytes, fallback) {
-  if (bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return 'image/png';
-  if (bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255) return 'image/jpeg';
-  if (/^GIF8[79]a$/.test(bytes.subarray(0, 6).toString())) return 'image/gif';
-  if (bytes.subarray(0, 4).toString() === 'RIFF' && bytes.subarray(8, 12).toString() === 'WEBP') return 'image/webp';
-  return fallback;
+  return detectMime(bytes, fallback);
 }
 async function imageData(url, fetchImpl = fetch) {
   if (String(url).startsWith('data:')) {

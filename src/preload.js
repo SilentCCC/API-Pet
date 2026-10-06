@@ -1,9 +1,12 @@
 const { contextBridge, ipcRenderer } = require('electron');
 contextBridge.exposeInMainWorld('apiPet', {
+  detectProviderCurrency: provider => ipcRenderer.invoke('detect-provider-currency', provider),
+  setChatFormat: format => ipcRenderer.invoke('set-chat-format', format),
   moveProvider: data => ipcRenderer.invoke('move-provider', data),
   generateImages: data => ipcRenderer.invoke('generate-images', data),
   saveGeneratedImage: url => ipcRenderer.invoke('save-generated-image', url),
   showGeneratedImageMenu: url => ipcRenderer.invoke('show-generated-image-menu', url),
+  showInlineImageMenu: image => ipcRenderer.invoke('show-inline-image-menu', image),
   resizePanelHeight: height => ipcRenderer.invoke('resize-panel-height', height),
   onPanelHeight: fn => ipcRenderer.on('panel-height', (_e, height) => fn(height)),
   resizePanelWidth: width => ipcRenderer.invoke('resize-panel-width', width),

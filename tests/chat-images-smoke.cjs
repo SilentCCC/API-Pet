@@ -35,9 +35,26 @@ const copyContext = vm.createContext({
 const copySource = fs.readFileSync(path.join(__dirname, '../src/main.js'), 'utf8');
 vm.runInContext(copySource.slice(copySource.indexOf("ipcMain.handle('show-generated-image-menu'"), copySource.indexOf("ipcMain.handle('save-provider'")), copyContext);
 let drawingFailure = false;
+let modelFetchFailure = false;
+let fetchedModels = ['test-model'];
+const modelFetches = [];
 const provider = { id: 'test', name: 'Test', models: ['test-model'], status: 'online', balance: {}, apiKeys: [{ key: 'test-only' }] };
-const state = { unifiedKey: 'test-only', routes: {}, unifiedRoute: {}, balanceSettings: {}, providers: [provider] };
+const state = { unifiedKey: 'test-only', chatFormat: 'responses', routes: {}, unifiedRoute: {}, balanceSettings: {}, providers: [provider] };
 const source = fs.readFileSync(path.join(__dirname, '../src/main.js'), 'utf8');
+const persistedFormats = [];
+let failFormatSave = false;
+const formatHandlers = {};
+vm.runInNewContext(source.slice(source.indexOf("ipcMain.handle('set-chat-format'"), source.indexOf("ipcMain.handle('generate-images'")), {
+  state, ipcMain: { handle: (name, handler) => { formatHandlers[name] = handler; } },
+  persist() {
+    if (failFormatSave) throw new Error('Format save test failure');
+    persistedFormats.push(state.chatFormat);
+  }
+});
+ipcMain.handle('set-chat-format', async (_event, format) => {
+  await new Promise(resolve => setTimeout(resolve, 40));
+  return formatHandlers['set-chat-format'](null, format);
+});
 const context = vm.createContext({
   state, mainWindow: null, providerModels: item => item.models,
   findProviderForModel: () => provider, selectProviderApiKey: () => 'test-only',
@@ -54,6 +71,10 @@ const context = vm.createContext({
 });
 vm.runInContext(source.slice(source.indexOf('async function directChatRequest('), source.indexOf('async function proxyChat(')), context);
 ipcMain.handle('get-state', () => state);
+ipcMain.handle('get-chat-models', (_event, input) => {
+  modelFetches.push(input);
+  return modelFetchFailure ? { ok: false, error: 'Model fetch test failure' } : { ok: true, models: fetchedModels };
+});
 ipcMain.handle('get-balance-activity', () => false);
 ipcMain.handle('set-panel-open', () => true);
 ipcMain.handle('chat-request', async (_event, input) => {
@@ -87,7 +108,25 @@ async function run() {
     await new Promise(resolve => setTimeout(resolve, 20));
     window.testImage = () => new File([Uint8Array.from(atob(${JSON.stringify(pixels)}), char => char.charCodeAt(0))], 'test.png', { type: 'image/png' });
     window.waitImages = () => chatImageQueue;
+    window.chooseChatFormat = async format => { $('chatFormat').value = format; await $('chatFormat').onchange(); };
   })()`);
+  assert.deepEqual(await execute(`Array.from($('chatFormat').options, option => option.value)`), ['responses', 'chat/completions']);
+  assert.equal(await execute(`$('chatFormat').value`), 'responses');
+  const originalRoute = JSON.stringify(state.unifiedRoute);
+  failFormatSave = true;
+  await execute(`chooseChatFormat('chat/completions')`);
+  assert.equal(state.chatFormat, 'responses');
+  assert.equal(await execute(`$('chatFormat').value`), 'responses');
+  assert.equal(await execute(`$('toast').textContent.includes('Format save test failure')`), true);
+  failFormatSave = false;
+  assert.equal(await execute(`Array.from($('chatSite').options).some(option => option.textContent === '自动选择')`), false);
+  assert.equal(await execute(`$('chatSite').value === '' && $('chatKey').disabled && $('chatModel').disabled && $('sendChat').disabled && currentChatModel() === ''`), true);
+  await execute(`(async () => { $('chatSite').value = 'test'; await $('chatSite').onchange(); })()`);
+  assert.equal(await execute(`$('sendChat').disabled && $('chatModel').disabled && !$('chatKey').disabled`), true);
+  await execute(`(async () => { $('chatKey').value = '0'; await $('chatKey').onchange(); })()`);
+  assert.deepEqual(modelFetches.at(-1), { providerId: 'test', keyIndex: 0 });
+  assert.equal(await execute(`currentChatModel()`), 'test-model');
+  assert.equal(await execute(`$('sendChat').disabled`), false);
   assert.equal(await execute(`(() => {
     let clicked = false;
     $('chatImageFiles').click = () => { clicked = true; };
@@ -114,10 +153,13 @@ async function run() {
   assert.equal(await execute(`$('chatAttachments').children.length`), 2);
   assert.equal(await execute(`chatPanel.classList.contains('drag-over')`), false);
   await execute(`$('chatMode').value = 'image'; $('chatMode').dispatchEvent(new Event('change'));`);
+  assert.equal(await execute(`getComputedStyle($('chatFormat')).display`), 'none');
   assert.equal(await execute(`$('sendChat').disabled`), false);
   assert.equal(await execute(`$('drawingParameters').classList.contains('hidden')`), false);
   assert.equal(await execute(`$('chatAttachments').children.length`), 2);
   await execute(`$('chatMode').value = 'text'; $('chatMode').dispatchEvent(new Event('change')); document.querySelector('#chatAttachments button').click();`);
+  assert.notEqual(await execute(`getComputedStyle($('chatFormat')).display`), 'none');
+  assert.equal(await execute(`(() => { const r = $('chatFormat').getBoundingClientRect(); return document.elementFromPoint(r.x + r.width/2, r.y + r.height/2) === $('chatFormat'); })()`), true);
   assert.equal(await execute(`$('chatAttachments').children.length`), 1);
   const layout = await execute(`(() => {
     const nodes = [$('chatMode'), $('chatInput'), $('addChatImage'), $('sendChat'), $('clearChat')];
@@ -133,7 +175,9 @@ async function run() {
   await execute(`new Promise(resolve => setTimeout(resolve, 100))`);
   fs.writeFileSync(path.join(output, 'attachments.png'), (await window.webContents.capturePage()).toPNG());
   const submit = async text => execute(`(async () => {
-    $('chatInput').value = ${JSON.stringify(text)}; $('chatForm').requestSubmit();
+    $('chatInput').value = ${JSON.stringify(text)}; $('chatInput').focus();
+    $('chatInput').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true, cancelable: true }));
+    if (chatSending && !$('chatFormat').disabled) throw new Error('Format must be disabled during requests');
     for (let i = 0; i < 50 && chatSending; i++) await new Promise(resolve => setTimeout(resolve, 20));
   })()`);
   await submit('Describe this image');
@@ -146,7 +190,16 @@ async function run() {
   assert.equal(await execute(`document.querySelectorAll('.chat-message.user img').length`), 1);
   await submit('Follow up');
   assert.equal(requests[1].body.input[0].content[1].type, 'input_image');
-  await execute(`(async () => { chatHistory = []; appState.routingMode = 'unified'; appState.unifiedRoute.format = 'chat/completions'; await addChatImages([testImage()]); })()`);
+  await execute(`(async () => {
+    chatHistory = []; appState.routingMode = 'unified';
+    const saving = chooseChatFormat('chat/completions');
+    if (!$('chatFormat').disabled || !$('sendChat').disabled) throw new Error('Format save must lock text sends');
+    await saving; await addChatImages([testImage()]);
+  })()`);
+  assert.equal(state.chatFormat, 'chat/completions');
+  assert.equal(JSON.stringify(state.unifiedRoute), originalRoute);
+  await execute(`new Promise(resolve => setTimeout(resolve, 80))`);
+  fs.writeFileSync(path.join(output, 'chat-format.png'), (await window.webContents.capturePage()).toPNG());
   await submit('');
   assert.ok(requests[2].url.endsWith('/chat/completions'));
   assert.equal(requests[2].body.messages[0].content[0].type, 'image_url');
@@ -178,16 +231,20 @@ async function run() {
   assert.ok(drawingLayout[3].height >= 35);
   await execute(`new Promise(resolve => setTimeout(resolve, 100))`);
   fs.writeFileSync(path.join(output, 'drawing-minimum.png'), (await window.webContents.capturePage()).toPNG());
-  await execute(`document.documentElement.style.setProperty('--panel-height', '430px'); $('chatInput').value = 'Draw a cat'; $('chatForm').requestSubmit();`);
+  await execute(`document.documentElement.style.setProperty('--panel-height', '430px'); $('chatInput').value = 'Draw a cat'; $('chatInput').focus(); $('chatInput').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true, cancelable: true }));`);
   assert.equal(await execute(`$('chatMode').disabled && document.querySelector('[data-drawing="resolution"]').disabled`), true);
   assert.equal(await execute(`['chatSite', 'chatKey', 'chatModel'].every(id => $(id).disabled)`), true);
   assert.equal(await execute(`$('clearChat').disabled`), true);
+  await execute(`$('chatInput').value = 'Do not send twice'; $('chatInput').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true, cancelable: true }));`);
   await execute(`(async () => { for (let i=0; i<100 && chatSending; i++) await new Promise(resolve => setTimeout(resolve,20)); })()`);
   assert.equal(await execute(`$('chatSite').disabled || $('chatModel').disabled`), false);
   await execute(`$('chatSite').value = 'test'; $('chatSite').dispatchEvent(new Event('change'));`);
   assert.equal(await execute(`chatSiteSelection`), 'test');
   assert.equal(await execute(`$('chatKey').disabled`), false);
-  await execute(`$('chatSite').value = ''; $('chatSite').dispatchEvent(new Event('change'));`);
+  await execute(`(async () => { $('chatKey').value = '0'; await $('chatKey').onchange(); })()`);
+  assert.deepEqual(await execute(`Array.from($('chatModel').options, option => option.value)`), ['test-model']);
+  assert.equal(await execute(`$('chatModel').textContent.includes('自动选择')`), false);
+  await execute(`$('chatModel').value = 'test-model'; $('chatModel').onchange();`);
   assert.equal(drawingRequests.length, 1);
   assert.equal(drawingRequests[0].referenceImages.length, 4);
   assert.equal(drawingRequests[0].quality, 'auto');
@@ -251,7 +308,7 @@ async function run() {
   await submit('New image conversation');
   assert.equal(requests.at(-1).body.messages.length, 1);
   assert.equal(requests.at(-1).body.messages[0].content[0].text, 'New image conversation');
-  await execute(`$('clearChat').click(); appState.unifiedRoute.format = 'responses';`);
+  await execute(`(async () => { $('clearChat').click(); await chooseChatFormat('responses'); })()`);
   await execute(`(async () => {
     $('chatInput').value = 'New text conversation'; $('chatForm').requestSubmit();
     if (!$('clearChat').disabled) throw new Error('Clear must be disabled during text request');
@@ -265,11 +322,62 @@ async function run() {
   await execute(`$('clearChat').click(); $('clearChat').click()`);
   assert.equal(await execute(`chatHistory.length`), 0);
   assert.equal(await execute(`document.querySelectorAll('.chat-empty').length`), 1);
+  const previousRequests = requests.length;
+  await execute(`(() => {
+    const input = $('chatInput'); input.value = 'Shortcut test'; input.focus();
+    for (const options of [{}, { ctrlKey: true, isComposing: true }, { ctrlKey: true, repeat: true }, { ctrlKey: true, altKey: true }]) {
+      input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true, cancelable: true, ...options }));
+    }
+    $('clearChat').focus();
+    $('clearChat').dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true, cancelable: true }));
+    input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', ctrlKey: true, bubbles: true, cancelable: true }));
+  })()`);
+  assert.equal(requests.length, previousRequests, 'Shortcut only submits from the focused input and ignores composition and repeats');
+  await execute(`$('chatInput').focus()`);
+  window.webContents.sendInputEvent({ type: 'keyDown', keyCode: 'Enter', modifiers: ['control'] });
+  window.webContents.sendInputEvent({ type: 'keyUp', keyCode: 'Enter', modifiers: ['control'] });
+  await execute(`(async () => { for (let i=0; i<100 && (chatHistory.length !== 2 || chatSending); i++) { await new Promise(resolve => setTimeout(resolve,20)); } })()`);
+  assert.equal(requests.length, previousRequests + 1, 'Real Ctrl+Enter keyboard input submits once');
   window.webContents.invalidate();
   await new Promise(resolve => setTimeout(resolve, 100));
   fs.writeFileSync(path.join(output, 'clear-button.png'), (await window.webContents.capturePage()).toPNG());
+  await execute(`chooseChatFormat('chat/completions')`);
+  assert.deepEqual(persistedFormats, ['chat/completions', 'responses', 'chat/completions']);
+  assert.equal(JSON.stringify(state.unifiedRoute), originalRoute);
+  await new Promise(resolve => { window.webContents.once('did-finish-load', resolve); window.reload(); });
+  await execute(`(async () => { for (let i=0; i<50 && !$('chatFormat').onchange; i++) await new Promise(resolve => setTimeout(resolve,20)); })()`);
+  assert.equal(await execute(`$('chatFormat').value`), 'chat/completions');
+  await execute(`$('openChat').click()`);
+  assert.equal(await execute(`$('chatSite').value`), 'test');
+  assert.equal(await execute(`$('sendChat').disabled && $('chatModel').disabled`), true, 'Reload requires a Key before sending');
+  modelFetchFailure = true;
+  await execute(`(async () => { $('chatKey').value = '0'; await $('chatKey').onchange(); })()`);
+  assert.equal(await execute(`$('sendChat').disabled && currentChatModel() === ''`), true);
+  modelFetchFailure = false; fetchedModels = [];
+  await execute(`(async () => { $('chatKey').value = '0'; await $('chatKey').onchange(); })()`);
+  assert.equal(await execute(`$('sendChat').disabled && $('chatModel').disabled && currentChatModel() === ''`), true);
+  fetchedModels = ['test-model', 'Pet model'];
+  await execute(`(async () => { $('chatKey').value = '0'; await $('chatKey').onchange(); })()`);
+  assert.deepEqual(await execute(`Array.from($('chatModel').options, option => option.value)`), ['Pet model', 'test-model']);
+  await execute(`$('chatModel').value = 'Pet model'; $('chatModel').onchange();`);
+  await submit('Actual upstream Pet model');
+  assert.equal(requests.at(-1).body.model, 'Pet model', 'A fetched Pet model is sent literally, never rewritten as a gateway alias');
+  fetchedModels = ['very-long-model-name-for-chat-format-layout-check'];
+  await execute(`(async () => { $('chatKey').value = '0'; await $('chatKey').onchange(); })()`);
+  await execute(`document.documentElement.style.setProperty('--panel-height', '320px'); updateChatModelLabel();`);
+  assert.equal(await execute(`(() => {
+    const format = $('chatFormat').getBoundingClientRect(), label = $('chatModelLabel').getBoundingClientRect(), close = $('closeChat').getBoundingClientRect();
+    return label.right <= format.left && format.right <= close.left && $('chatInput').getBoundingClientRect().bottom <= $('chatPanel').getBoundingClientRect().bottom
+      && document.elementFromPoint(format.x + format.width/2, format.y + format.height/2) === $('chatFormat');
+  })()`), true);
+  await execute(`new Promise(resolve => setTimeout(resolve, 80))`);
+  fs.writeFileSync(path.join(output, 'chat-format-minimum.png'), (await window.webContents.capturePage()).toPNG());
+  await execute(`appState.providers = []; render();`);
+  assert.equal(await execute(`$('chatSite').value === '' && $('chatSite').textContent.includes('请先添加站点') && $('sendChat').disabled && currentChatModel() === ''`), true);
   fs.writeFileSync(path.join(output, 'result.json'), JSON.stringify({ passed: true,
     contextChecks: ['clear history and generated previews', 'keep unsent draft', 'new requests exclude old text and images', 'request lock and restore', 'button layout'],
+    formatChecks: ['dropdown options', 'both request protocols', 'saved selection survives reload', 'save failure restores selection', 'save and request locks', 'drawing hides selector', 'gateway route unchanged', 'long model and minimum height layout'],
+    targetChecks: ['no automatic site or model option', 'explicit site and Key required', 'only fetched models in unified mode', 'failed and empty model lists disable sends', 'real upstream Pet model is preserved', 'reload requires Key selection', 'removed site clears target'],
     checks: ['plus opens file selection', 'file selection', 'drag and drop', 'preview decode', 'remove', 'mode preserves images', 'layout', 'responses image and history', 'chat completions image only', 'invalid and oversized files', 'four image limit', 'failure restores draft', 'drawing parameters and size changes', 'minimum height drawing layout', 'drawing request lock', 'generated preview and save', 'right click bitmap copy in preview and viewer', 'copy cancellation and failure', 'partial failure', 'drawing failure restores draft', 'model parameter changes', 'text mode hides parameters'] }, null, 2));
 }
 const timeout = setTimeout(() => {

@@ -16,7 +16,7 @@ function makeContext() {
   vm.runInContext(source.slice(source.indexOf('function clampWindowToDisplay('), source.indexOf('function providerBaseUrls(')), ctx);
   return ctx;
 }
-ipcMain.handle('get-state', () => ({ unifiedKey: 'test-only', providers: [], routes: {}, unifiedRoute: {}, balanceSettings: {} }));
+ipcMain.handle('get-state', () => ({ appVersion: require('../package.json').version, unifiedKey: 'test-only', providers: [], routes: {}, unifiedRoute: {}, balanceSettings: {} }));
 ipcMain.handle('get-balance-activity', () => false);
 ipcMain.handle('set-panel-open', (_event, open) => { context.setPanelWindowPosition(open); return true; });
 ipcMain.handle('resize-panel-height', (_event, height) => context.resizePanelHeight(height));
@@ -166,6 +166,20 @@ async function run() {
   await checkColumns();
   fs.writeFileSync(path.join(output, 'panel-width.png'), (await window.webContents.capturePage()).toPNG());
   assert.equal(await execute(`getComputedStyle($('routingGateway')).display`), 'none');
+  await execute(`appState.routingEnabled = true; appState.routingMode = 'unified';
+    appState.providers.find(p => p.id === 'saved').apiKeys = [{key:'route-test-key',remark:'默认 Key',enabled:true}];
+    appState.unifiedRoute = {providerId:'saved', apiKey:'route-test-key', model:'a', models:['a']}; render();
+    $('unifiedRoute').scrollIntoView({block:'center'});`);
+  await waitLayout();
+  assert.equal(await execute(`document.querySelector('#unifiedFormat') === null && $('unifiedProvider').value === 'saved' && $('unifiedTargetModel').value === 'a'`), true);
+  assert.equal(await execute(`$('unifiedRoute').textContent.includes('上游格式')`), false);
+  assert.deepEqual(await execute(`Array.from(document.querySelectorAll('.unified-field label'), el => el.firstChild.textContent)`), ['站点','Key','模型']);
+  assert.equal(await execute(`$('unifiedKeySelect').value`), '0');
+  assert.equal(await execute(`$('unifiedRoute').scrollWidth <= $('unifiedRoute').clientWidth`), true);
+  window.webContents.invalidate();
+  await waitLayout();
+  fs.writeFileSync(path.join(output, 'unified-route.png'), (await window.webContents.capturePage()).toPNG());
+  await execute(`appState.routingMode = 'model'; appState.routingEnabled = false; render();`);
   await execute(`appState.routingEnabled = true; appState.unifiedKey = 'pet-test-only-0123456789abcdef0123456789abcdef'; render();
     window.gatewayCopies = []; window.gatewayCopyFails = false;
     Object.defineProperty(navigator, 'clipboard', {configurable:true, value:{writeText: async text => {
@@ -200,6 +214,40 @@ async function run() {
   assert.equal(await execute(`$('toast').textContent.includes('复制失败')`), true);
   await execute(`appState.routingEnabled = false; renderMode();`);
   assert.equal(await execute(`getComputedStyle($('routingGateway')).display`), 'none');
+  await execute(`(() => {
+    const filler = document.createElement('div'); filler.id = 'scrollbarTestContent'; filler.style.height = '900px';
+    $('panel').querySelector('.panel-scroll').appendChild(filler);
+  })()`);
+  for (const width of [400, 500]) {
+    await execute(`window.apiPet.resizePanelWidth(${width}); $('panel').querySelector('.panel-scroll').scrollTop = 0;`);
+    await waitLayout();
+    const scrollbar = await execute(`(() => {
+      const scroller = $('panel').querySelector('.panel-scroll'), rect = scroller.getBoundingClientRect();
+      const handle = $('panel').querySelector('.panel-width-handle'), handleRect = handle.getBoundingClientRect();
+      const trackHeight = scroller.clientHeight - 48;
+      const x = rect.right - 6, y = rect.top + 24 + Math.max(12, trackHeight * scroller.clientHeight / scroller.scrollHeight / 2);
+      return { x, y, handleX: handleRect.left + handleRect.width / 2, handleY: handleRect.top + handleRect.height / 2,
+        scrollbarWidth: scroller.offsetWidth - scroller.clientWidth,
+        separate: rect.right <= handleRect.left && handleRect.right <= innerWidth,
+        scrollHit: document.elementFromPoint(x, y) === scroller,
+        resizeHit: document.elementFromPoint(handleRect.left + handleRect.width/2, handleRect.top + handleRect.height/2) === handle };
+    })()`);
+    assert.equal(scrollbar.scrollbarWidth, 12);
+    assert.equal(scrollbar.separate && scrollbar.scrollHit && scrollbar.resizeHit, true);
+    window.webContents.sendInputEvent({type:'mouseMove', x:Math.round(scrollbar.x), y:Math.round(scrollbar.y)});
+    window.webContents.sendInputEvent({type:'mouseDown', button:'left', clickCount:1, x:Math.round(scrollbar.x), y:Math.round(scrollbar.y)});
+    window.webContents.sendInputEvent({type:'mouseMove', x:Math.round(scrollbar.x), y:Math.round(scrollbar.y + 60)});
+    window.webContents.sendInputEvent({type:'mouseUp', button:'left', clickCount:1, x:Math.round(scrollbar.x), y:Math.round(scrollbar.y + 60)});
+    await waitLayout();
+    assert.ok(await execute(`$('panel').querySelector('.panel-scroll').scrollTop > 0`), 'Native scrollbar drag scrolls the panel');
+    assert.equal((await dimensions()).panelWidth, width, 'Scrollbar drag never changes panel width');
+    assert.equal(await execute(`appRoot.classList.contains('resizing-panel-width')`), false);
+    if (width === 400) fs.writeFileSync(path.join(output, 'scrollbar-separated.png'), (await window.webContents.capturePage()).toPNG());
+    const delta = width === 400 ? 20 : -20;
+    await dragWidth(delta);
+    assert.equal((await dimensions()).panelWidth, width + delta, 'Outer edge handle still resizes the panel');
+  }
+  await execute(`$('scrollbarTestContent').remove()`);
   context.setPanelWindowPosition(false);
   context = makeContext();
   await window.reload();
@@ -212,7 +260,10 @@ async function run() {
   await waitLayout();
   assert.equal((await dimensions()).panelWidth, 450);
   assert.equal(window.getBounds().width, 490);
-  fs.writeFileSync(path.join(output, 'result.json'), JSON.stringify({passed:true, checks:['default height', 'both top handles', 'upward drag', 'fixed chat width', 'fixed pet and bottom', 'panel downward drag', 'minimum height', 'cancel cleanup', 'invalid input', 'close and reopen', 'width drag', 'width limits', 'width and height independent', 'aligned columns at both width limits', 'gateway title and three fields', 'copy exact URL Key and model', 'live Key updates', 'gateway layout at both width limits', 'copy failure handling', 'gateway routing visibility', 'fresh startup reset']}, null, 2));
+  await execute(`$('panel').querySelector('footer').scrollIntoView({block:'end'});`);
+  await waitLayout();
+  fs.writeFileSync(path.join(output, 'panel-footer.png'), (await window.webContents.capturePage()).toPNG());
+  fs.writeFileSync(path.join(output, 'result.json'), JSON.stringify({passed:true, checks:['default height', 'both top handles', 'upward drag', 'fixed chat width', 'fixed pet and bottom', 'panel downward drag', 'minimum height', 'cancel cleanup', 'invalid input', 'close and reopen', 'width drag', 'width limits', 'width and height independent', 'aligned columns at both width limits', 'gateway title and three fields', 'copy exact URL Key and model', 'live Key updates', 'gateway layout at both width limits', 'copy failure handling', 'gateway routing visibility', 'fresh startup reset', '12px scrollbar', 'scrollbar and resize hit regions separated', 'native scrollbar drag preserves width at both limits']}, null, 2));
 }
 const timeout = setTimeout(() => { fs.writeFileSync(path.join(output,'result.json'), JSON.stringify({passed:false,error:'timeout'})); app.exit(1); }, 20000);
 run().then(() => { clearTimeout(timeout); window?.destroy(); app.exit(0); }).catch(error => { fs.writeFileSync(path.join(output,'result.json'), JSON.stringify({passed:false,error:error.stack})); clearTimeout(timeout); window?.destroy(); app.exit(1); });

@@ -1,4 +1,4 @@
-const { notConfigured, accountFetch } = require('./base');
+const { notConfigured, accountFetch, balanceCurrency, withCurrencyHeader } = require('./base');
 
 const QUOTA_PER_DOLLAR = 500000;
 
@@ -176,7 +176,7 @@ async function getJson(url, headers, signal, method = 'GET', onUnauthorized) {
     error.rateLimited = response.status === 429;
     throw error;
   }
-  return payload;
+  return withCurrencyHeader(payload, response, body);
 }
 
 function authContext(provider, origin, signal) {
@@ -304,7 +304,7 @@ module.exports = {
       return {
         balance,
         remaining: quotaAmount(findNumber(user, ['remaining_quota', 'remainingQuota'])) ?? balance,
-        currency: provider.currency || '$',
+        ...balanceCurrency(provider, [user, profile], Math.abs(rawBalance) >= 10000 ? '$' : ''),
         ...(Object.keys(accountStats).length ? { accountStats } : {})
       };
     } finally {

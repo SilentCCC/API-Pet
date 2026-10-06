@@ -4,7 +4,9 @@ const fs = require('fs');
 const http = require('http');
 const crypto = require('crypto');
 const balanceAdapters = require('./providers');
+const { currencySettings, rememberCurrency } = require('./provider-currency');
 const { requestImage, imageData } = require('./image-generation');
+const { detectMime } = require('./image-format');
 
 const PORT = 8787;
 let mainWindow;
@@ -173,7 +175,8 @@ function defaultState() {
     routingEnabled: false,
     routingMode: 'model',
     alwaysOnTop: true,
-    unifiedRoute: { providerId: '', model: '', format: 'responses' },
+    chatFormat: 'responses',
+    unifiedRoute: { providerId: '', apiKey: '', model: '', models: [] },
     balanceSettings: { lowThreshold: 5, refreshMinutes: 10 }
   };
 }
@@ -181,9 +184,8 @@ function loadState() {
   try {
     const saved = JSON.parse(fs.readFileSync(dataPath(), 'utf8'));
     const oldTarget = saved.virtualModel?.target || '';
-    const savedFormat = saved.unifiedRoute?.format;
-    const format = savedFormat === 'responses' || savedFormat === 'chat/completions' ? savedFormat : 'responses';
     const defaults = defaultState();
+    const providers = Array.isArray(saved.providers) ? saved.providers.map(normalizeProvider) : [];
     return {
       ...defaults,
       ...saved,
@@ -191,15 +193,16 @@ function loadState() {
       routingMode: saved.routingMode || 'model',
       alwaysOnTop: saved.alwaysOnTop !== false,
       balanceSettings: { ...defaults.balanceSettings, ...(saved.balanceSettings || {}) },
-      unifiedRoute: { ...defaults.unifiedRoute, ...(saved.unifiedRoute || {}), model: saved.unifiedRoute?.model || oldTarget, format },
-      providers: Array.isArray(saved.providers) ? saved.providers.map(normalizeProvider) : []
+      chatFormat: (saved.chatFormat || (saved.routingMode === 'unified' ? saved.unifiedRoute?.format : '')) === 'chat/completions' ? 'chat/completions' : 'responses',
+      unifiedRoute: normalizeUnifiedRoute({ ...saved.unifiedRoute, model: saved.unifiedRoute?.model || oldTarget }, providers),
+      providers
     };
   }
   catch { return defaultState(); }
 }
 let state = loadState();
 function persist() { fs.mkdirSync(path.dirname(dataPath()), { recursive: true }); fs.writeFileSync(dataPath(), JSON.stringify(state, null, 2)); }
-function safeState() { return JSON.parse(JSON.stringify(state)); }
+function safeState() { return { ...JSON.parse(JSON.stringify(state)), appVersion: app.getVersion() }; }
 function cleanBaseUrl(url) { return String(url || '').replace(/\/+$/, ''); }
 function todayKey() {
   const now = new Date();
@@ -261,6 +264,7 @@ function providerBaseUrls(provider) {
 }
 function providerModels(provider) { return Array.isArray(provider.models) ? provider.models : []; }
 function normalizeProvider(provider) {
+  const balanceAdapter = provider.balanceAdapter === 'neko-api' ? 'sub2api' : (provider.balanceAdapter || 'none');
   const loginUrl = cleanBaseUrl(provider.loginUrl || provider.baseUrl || provider.requestUrl);
   const requestSource = Object.prototype.hasOwnProperty.call(provider, 'requestUrl') ? provider.requestUrl : provider.baseUrl;
   const requestUrl = cleanBaseUrl(requestSource);
@@ -274,7 +278,7 @@ function normalizeProvider(provider) {
     loginUrl,
     requestUrl,
     baseUrl: requestUrl || loginUrl,
-    balanceAdapter: provider.balanceAdapter === 'neko-api' ? 'sub2api' : (provider.balanceAdapter || 'custom'),
+    balanceAdapter,
     apiKeys,
     apiKey: selectedKey.key,
     tokenRemark: selectedKey.remark,
@@ -287,20 +291,20 @@ function normalizeProvider(provider) {
     balanceMethod: provider.balanceMethod || 'GET',
     balancePath: provider.balancePath || 'data.balance',
     remainingPath: provider.remainingPath || '',
-    currency: provider.currency || '$',
+    ...currencySettings(provider),
     dailyStats: normalizeDailyStats(provider.dailyStats),
-    accountStats: provider.balanceAdapter !== 'none' && provider.accountStats && typeof provider.accountStats === 'object' ? { ...provider.accountStats } : null,
+    accountStats: balanceAdapter !== 'none' && provider.accountStats && typeof provider.accountStats === 'object' ? { ...provider.accountStats } : null,
     balance: {
       balance: null,
       remaining: null,
-      currency: provider.currency || '$',
       status: 'unknown',
       apiStatus: 'unknown',
       error: '',
       updatedAt: '',
       configured: false,
       ...(provider.balance || {}),
-      ...(provider.balanceAdapter === 'none' ? { balance: null, remaining: null, status: 'disabled', apiStatus: 'disabled', error: '', updatedAt: '', configured: false } : {})
+      currency: currencySettings(provider).currency,
+      ...(balanceAdapter === 'none' ? { balance: null, remaining: null, status: 'disabled', apiStatus: 'disabled', error: '', updatedAt: '', configured: false } : {})
     }
   };
 }
@@ -309,6 +313,17 @@ function selectProviderApiKey(provider) {
   provider.apiKey = String(selected?.key || provider.apiKey || '').trim();
   provider.tokenRemark = String(selected?.remark || provider.tokenRemark || '');
   return provider.apiKey;
+}
+function unifiedRouteKey(provider, route = state.unifiedRoute) {
+  if (!provider) return '';
+  if (!Object.prototype.hasOwnProperty.call(route, 'apiKey')) return selectProviderApiKey(provider);
+  return provider.apiKeys?.some(item => item.key === route.apiKey) ? route.apiKey : '';
+}
+function normalizeUnifiedRoute(route = {}, providers = state.providers) {
+  const provider = providers.find(item => item.id === route.providerId);
+  const apiKey = unifiedRouteKey(provider, route);
+  const models = apiKey ? (Array.isArray(route.models) ? route.models : providerModels(provider)).slice() : [];
+  return { providerId: provider?.id || '', apiKey, model: models.includes(route.model) ? route.model : '', models };
 }
 function findProviderForModel(model) {
   const selected = state.routes[model];
@@ -360,10 +375,15 @@ async function fetchModels(provider, apiKeyOverride = '') {
 async function testProvider(id) {
   const provider = state.providers.find(p => p.id === id);
   if (!provider) throw new Error('Provider not found');
+  const apiKey = selectProviderApiKey(provider);
   try {
-    const models = await fetchModels(provider);
+    const models = await fetchModels(provider, apiKey);
     provider.models = models; provider.status = 'online'; provider.error = ''; provider.lastChecked = new Date().toISOString(); persist();
-    if (state.unifiedRoute.providerId === id && !models.includes(state.unifiedRoute.model)) { state.unifiedRoute.model = ''; persist(); }
+    if (state.unifiedRoute.providerId === id && unifiedRouteKey(provider) === apiKey) {
+      state.unifiedRoute.models = models;
+      if (!models.includes(state.unifiedRoute.model)) state.unifiedRoute.model = '';
+      persist();
+    }
     return { ok: true, models, state: safeState() };
   } catch (e) {
     provider.status = 'error'; provider.error = e.message; provider.lastChecked = new Date().toISOString(); persist();
@@ -402,11 +422,12 @@ async function queryProviderBalance(id) {
     try {
       const adapter = getProviderAdapter(provider);
       const result = await adapter.getBalance(provider);
+      rememberCurrency(provider, result);
       provider.balance = {
         ...provider.balance,
         balance: result.balance,
         remaining: result.remaining ?? null,
-        currency: result.currency || provider.currency || '$',
+        currency: provider.currency,
         status: balanceStatus(result.balance, state.balanceSettings.lowThreshold),
         apiStatus: 'online',
         error: '',
@@ -742,6 +763,7 @@ ipcMain.handle('connect-provider-account', async (_e, input) => {
           } catch {}
         }
         provider.balanceAdapter = resolvedAdapter.id;
+        rememberCurrency(provider, accountData);
         // New API access tokens are short-lived. The adapter may refresh one from
         // the captured session cookie while validating the account, so prefer the
         // refreshed value from accountProvider over the stale captured value.
@@ -762,7 +784,7 @@ ipcMain.handle('connect-provider-account', async (_e, input) => {
           ...(provider.balance || {}),
           balance: Number(accountData.balance),
           remaining: accountData.remaining ?? null,
-          currency: accountData.currency || provider.currency || '$',
+          currency: provider.currency,
           status: balanceStatus(accountData.balance, state.balanceSettings.lowThreshold),
           apiStatus: 'online',
           error: '',
@@ -772,7 +794,7 @@ ipcMain.handle('connect-provider-account', async (_e, input) => {
         provider.balanceStatus = provider.balance.status;
         provider.balanceError = '';
         if (!isDraft) persist();
-        const snapshot = { accountToken: provider.accountToken, accountRefreshToken: provider.accountRefreshToken, accountCookie: provider.accountCookie, accountUserId: provider.accountUserId, accountSession: provider.accountSession, accountStats: provider.accountStats, balance: provider.balance, balanceAdapter: provider.balanceAdapter };
+        const snapshot = { accountToken: provider.accountToken, accountRefreshToken: provider.accountRefreshToken, accountCookie: provider.accountCookie, accountUserId: provider.accountUserId, accountSession: provider.accountSession, accountStats: provider.accountStats, balance: provider.balance, balanceAdapter: provider.balanceAdapter, ...currencySettings(provider) };
         await finish({ ok: true, state: safeState(), ...(isDraft ? { provider: snapshot } : {}) });
         if (!loginWindow.isDestroyed()) loginWindow.close();
       } finally {
@@ -825,19 +847,18 @@ async function directChatRequest(input = {}) {
   if (requestedProviderId) {
     provider = state.providers.find(item => item.id === requestedProviderId);
     const requestedKeyIndex = input.apiKeyIndex == null ? null : Number(input.apiKeyIndex);
-    if (model === 'Pet model') model = String(input.targetModel || '').trim() || providerModels(provider || {})[0] || resolveRequestedModel(model);
     if (!model) model = providerModels(provider || {})[0] || '';
     if (!provider || (requestedKeyIndex == null ? !providerModels(provider).includes(model) : !provider.apiKeys?.[requestedKeyIndex]?.key)) throw new Error(`站点没有模型或 Key：${model || '未选择模型'}`);
   } else if (requestedModel === 'Pet model') {
     model = resolveRequestedModel(requestedModel);
-    provider = state.providers.find(item => item.id === state.unifiedRoute?.providerId && providerModels(item).includes(model));
+    provider = state.providers.find(item => item.id === state.unifiedRoute?.providerId && (state.unifiedRoute.models || providerModels(item)).includes(model));
   } else {
     provider = findProviderForModel(model);
   }
   if (!provider) throw new Error(`没有找到模型对应的 Provider：${model || '未选择模型'}`);
   const requestedKeyIndex = requestedProviderId && input.apiKeyIndex != null ? Number(input.apiKeyIndex) : null;
   const apiKey = requestedKeyIndex == null
-    ? selectProviderApiKey(provider)
+    ? (!requestedProviderId && requestedModel === 'Pet model' ? unifiedRouteKey(provider) : selectProviderApiKey(provider))
     : provider.apiKeys?.[requestedKeyIndex]?.key;
   if (!apiKey) throw new Error('所选 API Key 无效');
   const format = input.format === 'chat/completions' ? 'chat/completions' : 'responses';
@@ -883,29 +904,22 @@ async function proxyChat(req, res, body, endpoint = '/chat/completions') {
   if (state.routingMode === 'model' && requestedModel === 'Pet model') return writeJson(res, 400, { error: { message: '当前为模型路由模式，请切换到统一模型模式后再请求 Pet model', type: 'api_pet_mode_error' } });
   const model = resolveRequestedModel(requestedModel);
   if (requestedModel === 'Pet model' && !model) return writeJson(res, 400, { error: { message: '统一模型尚未选择目标模型', type: 'api_pet_virtual_model_error' } });
-  if (state.routingMode === 'unified' && requestedModel === 'Pet model') {
-    const selectedFormat = state.unifiedRoute?.format === 'chat/completions' ? 'chat/completions' : 'responses';
-    if (endpoint.slice(1) !== selectedFormat) {
-      return writeJson(res, 400, { error: { message: `统一模型格式已设置为 ${selectedFormat}，客户端请使用对应的 /v1/${selectedFormat} 端点`, type: 'api_pet_format_mismatch' } });
-    }
-  }
   const requestedProviderId = String(body?.api_pet_provider_id || '').trim();
-  const provider = requestedProviderId
+  const provider = requestedModel === 'Pet model'
+    ? state.providers.find(p => p.id === state.unifiedRoute?.providerId && (state.unifiedRoute.models || providerModels(p)).includes(model))
+    : requestedProviderId
     ? state.providers.find(p => p.id === requestedProviderId && providerModels(p).includes(model))
-    : requestedModel === 'Pet model'
-      ? state.providers.find(p => p.id === state.unifiedRoute?.providerId && providerModels(p).includes(model))
-      : findProviderForModel(model);
+    : findProviderForModel(model);
   if (!provider) return writeJson(res, 404, { error: { message: `No provider configured for model: ${model}`, type: 'api_pet_routing_error' } });
-  selectProviderApiKey(provider);
+  const apiKey = requestedModel === 'Pet model' ? unifiedRouteKey(provider) : selectProviderApiKey(provider);
+  if (!apiKey) return writeJson(res, 400, { error: { message: '统一路由所选 Key 无效，请重新选择站点、Key 和模型', type: 'api_pet_key_error' } });
   const requestStartedAt = Date.now();
   recordProviderRequest(provider);
   persist();
   mainWindow?.webContents.send('gateway-status', { status: 'requesting', model: requestedModel, target: model, provider: provider.name });
   try {
-    const selectedFormat = state.routingMode === 'unified' && requestedModel === 'Pet model'
-      ? (state.unifiedRoute?.format === 'chat/completions' ? 'chat/completions' : 'responses')
-      : endpoint.slice(1);
-    const upstreamEndpoint = `/${selectedFormat}`;
+    // The client chooses the protocol by calling /chat/completions or /responses.
+    const upstreamEndpoint = endpoint;
     const upstreamBody = { ...body, model };
     delete upstreamBody.api_pet_provider_id;
     let upstream;
@@ -913,7 +927,7 @@ async function proxyChat(req, res, body, endpoint = '/chat/completions') {
     let lastError;
     for (const base of providerBaseUrls(provider)) {
       upstreamUrl = `${base}${upstreamEndpoint}`;
-      upstream = await fetch(upstreamUrl, { method: 'POST', headers: { Authorization: `Bearer ${provider.apiKey}`, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' }, body: JSON.stringify(upstreamBody) });
+      upstream = await fetch(upstreamUrl, { method: 'POST', headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' }, body: JSON.stringify(upstreamBody) });
       const contentType = upstream.headers.get('content-type') || '';
       if (upstream.ok && !contentType.toLowerCase().includes('text/html')) break;
       lastError = new Error(`${upstream.status} ${upstream.statusText}${contentType ? ` (${contentType})` : ''}`);
@@ -970,6 +984,38 @@ app.on('before-quit', () => { isQuitting = true; });
 app.on('will-quit', () => { tray?.destroy(); gateway?.close(); });
 
 ipcMain.handle('get-state', () => safeState());
+ipcMain.handle('detect-provider-currency', async (_e, input = {}) => {
+  let provider;
+  try {
+    const existing = state.providers.find(provider => provider.id === input.id);
+    const previousToken = existing?.accountToken;
+    const previousRefreshToken = existing?.accountRefreshToken;
+    provider = normalizeProvider({ ...existing, ...input, currencyMode: 'auto' });
+    const canPersistRotation = existing && provider.loginUrl === existing.loginUrl
+      && provider.balanceAdapter === existing.balanceAdapter && provider.accountToken === previousToken
+      && provider.accountRefreshToken === previousRefreshToken && provider.accountUserId === existing.accountUserId
+      && provider.accountCookie === existing.accountCookie && provider.accountSession === existing.accountSession;
+    if (provider.balanceAdapter === 'none') throw new Error('当前站点不查询余额');
+    let result;
+    try { result = await getProviderAdapter(provider).getBalance(provider); }
+    finally {
+      if (canPersistRotation && state.providers.includes(existing)
+          && existing.loginUrl === provider.loginUrl && existing.balanceAdapter === provider.balanceAdapter
+          && existing.accountToken === previousToken && existing.accountRefreshToken === previousRefreshToken
+          && (provider.accountToken !== previousToken || provider.accountRefreshToken !== previousRefreshToken)) {
+        existing.accountToken = provider.accountToken;
+        existing.accountRefreshToken = provider.accountRefreshToken;
+        persist();
+      }
+    }
+    return { ok: true, detectedCurrency: result.detectedCurrency || '', currencyDetection: result.currencyDetection || 'failed',
+      credentials: { accountToken: provider.accountToken, accountRefreshToken: provider.accountRefreshToken } };
+  } catch (error) {
+    return { ok: false, error: String(error?.message || error), ...(provider ? {
+      credentials: { accountToken: provider.accountToken, accountRefreshToken: provider.accountRefreshToken }
+    } : {}) };
+  }
+});
 ipcMain.handle('get-chat-models', async (_e, { providerId, keyIndex }) => {
   try { return { ok: true, models: await fetchChatModels(providerId, keyIndex) }; }
   catch (error) { return { ok: false, error: String(error?.message || error) }; }
@@ -998,6 +1044,14 @@ ipcMain.handle('chat-request', async (_e, input) => {
   try { return { ok: true, payload: await directChatRequest(input) }; }
   catch (error) { return { ok: false, error: String(error?.message || error) }; }
 });
+ipcMain.handle('set-chat-format', (_e, format) => {
+  if (!['responses', 'chat/completions'].includes(format)) throw new Error('不支持的对话请求格式');
+  const previous = state.chatFormat;
+  state.chatFormat = format;
+  try { persist(); }
+  catch (error) { state.chatFormat = previous; throw error; }
+  return state.chatFormat;
+});
 ipcMain.handle('generate-images', async (_e, input = {}) => {
   try {
     let model = String(input.model || '').trim();
@@ -1005,16 +1059,16 @@ ipcMain.handle('generate-images', async (_e, input = {}) => {
     let provider;
     if (providerId) {
       provider = state.providers.find(item => item.id === providerId);
-      if (model === 'Pet model') model = String(input.targetModel || '').trim() || providerModels(provider || {})[0];
     } else if (model === 'Pet model') {
       model = resolveRequestedModel(model);
       provider = state.providers.find(item => item.id === state.unifiedRoute?.providerId);
     } else provider = findProviderForModel(model);
     if (!provider || !model) throw new Error('请选择可用的站点、Key 和绘图模型');
     const keyIndex = providerId && input.apiKeyIndex != null ? Number(input.apiKeyIndex) : null;
-    if (keyIndex == null && !providerModels(provider).includes(model)) throw new Error('站点没有所选模型');
+    const models = !providerId && input.model === 'Pet model' ? state.unifiedRoute.models || providerModels(provider) : providerModels(provider);
+    if (keyIndex == null && !models.includes(model)) throw new Error('站点没有所选模型');
     if (keyIndex != null && (!Number.isInteger(keyIndex) || keyIndex < 0)) throw new Error('所选 Key 无效');
-    const apiKey = keyIndex == null ? selectProviderApiKey(provider) : provider.apiKeys?.[keyIndex]?.key;
+    const apiKey = keyIndex == null ? (!providerId && input.model === 'Pet model' ? unifiedRouteKey(provider) : selectProviderApiKey(provider)) : provider.apiKeys?.[keyIndex]?.key;
     if (!apiKey) throw new Error('所选 Key 无效');
     const count = /^sensenova-u1\.5-lite$/i.test(model.split('/').pop()) ? 1 : Math.min(5, Math.max(1, Math.floor(Number(input.count) || 1)));
     const bases = providerBaseUrls(provider);
@@ -1071,28 +1125,60 @@ ipcMain.handle('show-generated-image-menu', (event, url) => new Promise(resolve 
   menu.popup({ window: BrowserWindow.fromWebContents(event.sender) || mainWindow,
     callback: () => { if (!selected) resolve({ ok: true, canceled: true }); } });
 }));
+ipcMain.handle('show-inline-image-menu', (event, input) => new Promise(resolve => {
+  let selected = false;
+  let bytes;
+  try { bytes = input?.bytes ? Buffer.from(input.bytes) : Buffer.alloc(0); }
+  catch { return resolve({ ok: false, error: '图片数据无效' }); }
+  const mimeType = detectMime(bytes);
+  if (!mimeType || !bytes.length || bytes.length > 40 * 1024 * 1024) return resolve({ ok: false, error: '图片数据无效或超过 40 MB' });
+  const save = async () => {
+    const extension = mimeType.split('/')[1]?.replace('jpeg', 'jpg') || 'png';
+    const result = await dialog.showSaveDialog(BrowserWindow.fromWebContents(event.sender) || mainWindow, {
+      title: '保存图片', defaultPath: `API-Pet-${Date.now()}.${extension}`,
+      filters: [{ name: '图片', extensions: [extension] }]
+    });
+    if (result.canceled || !result.filePath) return { ok: true, canceled: true };
+    await fs.promises.writeFile(result.filePath, bytes);
+    return { ok: true, saved: true };
+  };
+  const menu = Menu.buildFromTemplate([
+    { label: '保存图片', click: async () => { selected = true; try { resolve(await save()); } catch (error) { resolve({ ok: false, error: error.message || '保存失败' }); } } },
+    { label: '复制', click: async () => {
+      selected = true;
+      try {
+        const native = nativeImage.createFromBuffer(bytes);
+        if (native.isEmpty()) throw new Error('图片解码失败');
+        clipboard.writeImage(native);
+        resolve({ ok: true, copied: true });
+      } catch (error) { resolve({ ok: false, error: error.message || '复制失败' }); }
+    } }
+  ]);
+  menu.popup({ window: BrowserWindow.fromWebContents(event.sender) || mainWindow,
+    callback: () => { if (!selected) resolve({ ok: true, canceled: true }); } });
+}));
 ipcMain.handle('save-provider', (_e, input) => {
   const existing = input.id ? state.providers.find(p => p.id === input.id) : null;
   const requestUrl = Object.prototype.hasOwnProperty.call(input, 'requestUrl') ? cleanBaseUrl(input.requestUrl) : (existing?.requestUrl || '');
   const tokenRemark = Object.prototype.hasOwnProperty.call(input, 'tokenRemark') ? String(input.tokenRemark || '').trim() : (existing?.tokenRemark || '');
   const apiKeys = Array.isArray(input.apiKeys) ? input.apiKeys : [{ key: String(input.apiKey || '').trim() || existing?.apiKey || '', remark: tokenRemark, enabled: true }];
-  const selectedAdapter = input.balanceAdapter === 'neko-api' ? 'sub2api' : (input.balanceAdapter || 'sub2api');
-  const record = normalizeProvider({ id: input.id || crypto.randomUUID(), name: String(input.name || '未命名 Provider').trim(), loginUrl: cleanBaseUrl(input.loginUrl) || existing?.loginUrl || existing?.baseUrl || '', requestUrl, apiKeys, apiKey: String(input.apiKey || '').trim() || existing?.apiKey || '', tokenRemark, accountToken: String(input.accountToken || '').trim() || existing?.accountToken || '', accountCookie: String(input.accountCookie || '').trim() || existing?.accountCookie || '', accountSession: String(input.accountSession || '').trim() || existing?.accountSession || '', accountUserId: String(input.accountUserId || '').trim() || existing?.accountUserId || '', accountStats: input.accountStats || (existing?.balanceAdapter === selectedAdapter ? existing?.accountStats || null : null), balance: input.balance || null, models: [], status: 'unknown', error: '', balanceAdapter: selectedAdapter, balanceUrl: input.balanceUrl, balanceMethod: input.balanceMethod, balancePath: input.balancePath, remainingPath: input.remainingPath, currency: input.currency, dailyStats: existing?.dailyStats });
+  const selectedAdapter = input.balanceAdapter === 'neko-api' ? 'sub2api' : (input.balanceAdapter || 'none');
+  const record = normalizeProvider({ id: input.id || crypto.randomUUID(), name: String(input.name || '未命名 Provider').trim(), loginUrl: cleanBaseUrl(input.loginUrl) || existing?.loginUrl || existing?.baseUrl || '', requestUrl, apiKeys, apiKey: String(input.apiKey || '').trim() || existing?.apiKey || '', tokenRemark, accountToken: String(input.accountToken || '').trim() || existing?.accountToken || '', accountCookie: String(input.accountCookie || '').trim() || existing?.accountCookie || '', accountSession: String(input.accountSession || '').trim() || existing?.accountSession || '', accountUserId: String(input.accountUserId || '').trim() || existing?.accountUserId || '', accountStats: input.accountStats || (existing?.balanceAdapter === selectedAdapter ? existing?.accountStats || null : null), balance: input.balance || null, models: [], status: 'unknown', error: '', balanceAdapter: selectedAdapter, balanceUrl: input.balanceUrl, balanceMethod: input.balanceMethod, balancePath: input.balancePath, remainingPath: input.remainingPath, currency: input.currency, currencyMode: input.currencyMode || (existing ? currencySettings(existing).currencyMode : undefined), detectedCurrency: input.detectedCurrency ?? existing?.detectedCurrency, currencyDetection: input.currencyDetection ?? existing?.currencyDetection, dailyStats: existing?.dailyStats });
   record.accountRefreshToken = cleanSessionToken(input.accountRefreshToken || existing?.accountRefreshToken);
   const idx = state.providers.findIndex(p => p.id === record.id);
   if (idx >= 0) {
     record.models = state.providers[idx].models || [];
-    if (selectedAdapter !== 'none') record.balance = { ...(state.providers[idx].balance || record.balance), currency: record.currency };
+    if (selectedAdapter !== 'none') record.balance = { ...(input.balance || state.providers[idx].balance || record.balance), currency: record.currency };
     state.providers[idx] = { ...state.providers[idx], ...record };
   } else state.providers.push(record);
+  if (state.unifiedRoute.providerId === record.id) state.unifiedRoute = normalizeUnifiedRoute(state.unifiedRoute);
   persist(); return safeState();
 });
-ipcMain.handle('delete-provider', (_e, id) => { state.providers = state.providers.filter(p => p.id !== id); Object.keys(state.routes).forEach(m => { if (state.routes[m] === id) delete state.routes[m]; }); if (state.unifiedRoute.providerId === id) state.unifiedRoute = { providerId: '', model: '', format: state.unifiedRoute.format || 'responses' }; persist(); return safeState(); });
+ipcMain.handle('delete-provider', (_e, id) => { state.providers = state.providers.filter(p => p.id !== id); Object.keys(state.routes).forEach(m => { if (state.routes[m] === id) delete state.routes[m]; }); if (state.unifiedRoute.providerId === id) state.unifiedRoute = { providerId: '', apiKey: '', model: '', models: [] }; persist(); return safeState(); });
 ipcMain.handle('test-provider', (_e, id) => testProvider(id));
 ipcMain.handle('move-provider', (_e, input) => {
-  const direction = input?.direction === 'up' ? -1 : input?.direction === 'down' ? 1 : 0;
   const index = state.providers.findIndex(provider => provider.id === input?.id);
-  const target = Number.isInteger(input?.targetIndex) ? input.targetIndex : direction ? index + direction : -1;
+  const target = Number.isInteger(input?.targetIndex) ? input.targetIndex : -1;
   if (index < 0 || target < 0 || target >= state.providers.length || target === index) return safeState();
   const [provider] = state.providers.splice(index, 1);
   state.providers.splice(target, 0, provider);
@@ -1109,14 +1195,28 @@ ipcMain.handle('set-balance-settings', (_e, settings) => {
 ipcMain.handle('set-route', (_e, { model, providerId }) => { state.routes[model] = providerId; persist(); return safeState(); });
 ipcMain.handle('set-routing-mode', (_e, mode) => { state.routingMode = mode === 'unified' ? 'unified' : 'model'; persist(); return safeState(); });
 ipcMain.handle('set-routing-enabled', (_e, enabled) => { state.routingEnabled = enabled === true; persist(); return safeState(); });
-ipcMain.handle('set-unified-route', (_e, route) => {
+ipcMain.handle('set-unified-route', async (_e, route) => {
   const providerId = String(route?.providerId || '');
   const provider = state.providers.find(p => p.id === providerId);
-  const model = String(route?.model || '');
-  const format = route?.format === 'responses' || route?.format === 'chat/completions'
-    ? route.format
-    : (state.unifiedRoute?.format === 'chat/completions' ? 'chat/completions' : 'responses');
-  state.unifiedRoute = { providerId: provider?.id || '', model: provider && providerModels(provider).includes(model) ? model : '', format };
+  if (Object.prototype.hasOwnProperty.call(route, 'keyIndex')) {
+    const index = route.keyIndex === '' || route.keyIndex == null ? -1 : Number(route.keyIndex);
+    const apiKey = Number.isInteger(index) && index >= 0 ? provider?.apiKeys?.[index]?.key || '' : '';
+    const target = { providerId: provider?.id || '', apiKey, model: '', models: [] };
+    state.unifiedRoute = target;
+    persist();
+    if (apiKey) {
+      const models = await fetchModels(provider, apiKey);
+      if (state.unifiedRoute === target && unifiedRouteKey(state.providers.find(item => item.id === providerId), target)) {
+        target.models = models;
+        persist();
+      }
+    }
+    return safeState();
+  }
+  const current = state.unifiedRoute;
+  if (provider?.id === current.providerId && Object.prototype.hasOwnProperty.call(route, 'model')) {
+    state.unifiedRoute = { ...current, model: unifiedRouteKey(provider) && (current.models || providerModels(provider)).includes(route.model) ? String(route.model) : '' };
+  } else state.unifiedRoute = { providerId: provider?.id || '', apiKey: '', model: '', models: [] };
   persist(); return safeState();
 });
 ipcMain.handle('quit', () => app.quit());

@@ -1,4 +1,4 @@
-const { notConfigured } = require('./base');
+const { notConfigured, balanceCurrency } = require('./base');
 
 function valueAtPath(value, path) {
   return String(path || '').split('.').filter(Boolean).reduce((current, key) => current == null ? undefined : current[key], value);
@@ -27,7 +27,8 @@ module.exports = {
       if (!Number.isFinite(balance)) throw new Error(`余额字段不是数字，请检查响应字段路径：${provider.balancePath || 'data.balance'}`);
       const remainingRaw = provider.remainingPath ? valueAtPath(body, provider.remainingPath) : undefined;
       const remaining = remainingRaw == null || remainingRaw === '' ? null : Number(String(remainingRaw).replace(/[, ]/g, ''));
-      return { balance, remaining: Number.isFinite(remaining) ? remaining : null, currency: provider.currency || '$' };
+      return { balance, remaining: Number.isFinite(remaining) ? remaining : null,
+        ...balanceCurrency(provider, [body, { currency: response.headers?.get?.('x-currency') }]) };
     } finally {
       clearTimeout(timer);
     }

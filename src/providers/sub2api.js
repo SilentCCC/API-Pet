@@ -1,4 +1,4 @@
-const { notConfigured, accountFetch } = require('./base');
+const { notConfigured, accountFetch, balanceCurrency, withCurrencyHeader } = require('./base');
 const pendingRefreshes = new WeakMap();
 
 function parseNumber(value) {
@@ -100,7 +100,7 @@ async function getJson(url, context, signal) {
     error.rateLimited = response.status === 429;
     throw error;
   }
-  return body?.data ?? body;
+  return withCurrencyHeader(body?.data ?? body, response, body);
 }
 
 async function getProfile(provider, context, signal) {
@@ -200,7 +200,7 @@ module.exports = {
       return {
         balance,
         remaining: null,
-        currency: provider.currency || '$',
+        ...balanceCurrency(provider, [user, profile, stats]),
         ...(stats ? { accountStats: {
           todayCost,
           todayRequests,

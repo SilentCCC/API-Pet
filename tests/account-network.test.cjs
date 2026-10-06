@@ -10,6 +10,7 @@ function loadNetwork(electron, netFetch, nodeFetch) {
     module: { exports: {} },
     process: { versions: electron ? { electron: '31' } : {} },
     require: name => {
+      if (name === '../provider-currency') return require('../src/provider-currency');
       assert.equal(name, 'electron');
       return { net: { fetch: netFetch } };
     },
@@ -53,7 +54,7 @@ test('New API balance and token imports also use the account network transport',
   const calls = [];
   const context = vm.createContext({
     module: { exports: {} }, URL, AbortController, setTimeout, clearTimeout,
-    require: () => ({ accountFetch: async (url, options) => {
+    require: () => ({ ...require('../src/providers/base'), accountFetch: async (url, options) => {
       const pathname = new URL(url).pathname;
       calls.push(pathname);
       assert.equal(options.headers.Authorization, 'Bearer test-account-token');

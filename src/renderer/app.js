@@ -3,6 +3,7 @@ let appState;
 let editingId = null;
 let connectingAccounts = 0;
 let refreshingAllAccounts = false;
+let refreshingAllBalances = false;
 let providerTestsActive = 0;
 let manualBalanceQueries = 0;
 let balanceQueryActive = false;
@@ -25,6 +26,7 @@ let chatModelsLoading = false;
 let chatImages = [];
 let chatImagesLoading = 0;
 let chatSending = false;
+let chatFormatSaving = false;
 let chatImageQueue = Promise.resolve();
 const CHAT_IMAGE_LIMIT = 4;
 const CHAT_IMAGE_MAX_BYTES = 10 * 1024 * 1024;
@@ -37,6 +39,10 @@ let providerTokenRows = [];
 let providerDrag = null;
 let providerOrderSaving = false;
 let draftAccountData = null;
+let currencyDetectionToken = 0;
+let draftDetectedCurrency = '';
+let draftCurrencyDetection = 'pending';
+let unifiedRouteSaving = false;
 const panel = $('panel');
 const chatPanel = $('chatPanel');
 const dialog = $('providerDialog');
@@ -310,8 +316,21 @@ function ensureProviderToggle() {
   refreshAccounts.className = 'ghost small';
   refreshAccounts.textContent = '一键刷新账户';
   refreshAccounts.onclick = refreshAllProviderAccounts;
-  actions.append(refreshAccounts, toggle, addButton);
+  const refreshBalances = document.createElement('button');
+  refreshBalances.id = 'refreshAllProviderBalances';
+  refreshBalances.type = 'button';
+  refreshBalances.className = 'ghost small';
+  refreshBalances.textContent = '一键刷新余额';
+  refreshBalances.onclick = refreshAllProviderBalances;
+  actions.append(refreshAccounts, refreshBalances, toggle, addButton);
+  title.classList.add('provider-heading');
   title.appendChild(actions);
+}
+function updateBalanceRefreshButtons() {
+  const disabled = refreshingAllBalances || appState.providers.every(provider => provider.balanceAdapter === 'none');
+  $('refreshAllProviderBalances').disabled = disabled;
+  $('refreshAllBalances').disabled = disabled;
+  $('refreshAllProviderBalances').textContent = refreshingAllBalances ? '刷新中…' : '一键刷新余额';
 }
 function moveGatewayIntoRouting() {
   const routes = $('routes');
@@ -339,15 +358,17 @@ function render() {
   if (providerDrag?.dragging) return;
   providerDrag?.cancel();
   $('unifiedKey').textContent = appState.unifiedKey;
+  $('appVersion').textContent = appState.appVersion ? `v${appState.appVersion}` : '';
   $('lowThreshold').value = appState.balanceSettings?.lowThreshold ?? 5;
   $('refreshMinutes').value = appState.balanceSettings?.refreshMinutes ?? 10;
   const allProvidersCollapsed = providersCollapsed || (appState.providers.length > 0 && appState.providers.every(provider => collapsedProviderIds.has(provider.id)));
   $('refreshAllAccounts').disabled = refreshingAllAccounts || appState.providers.every(provider => !['sub2api', 'new-api', 'aihub'].includes(provider.balanceAdapter));
+  updateBalanceRefreshButtons();
   $('toggleProviders').textContent = allProvidersCollapsed ? '展开全部' : '折叠全部';
   $('toggleProviders').setAttribute('aria-expanded', String(!allProvidersCollapsed));
   const list = $('providers');
   list.innerHTML = '';
-  appState.providers.forEach((provider, index) => {
+  appState.providers.forEach(provider => {
     const card = document.createElement('div');
     card.className = 'provider-card';
     card.dataset.providerId = provider.id;
@@ -378,8 +399,7 @@ function render() {
     if (providersCollapsed) setupProviderDragSort(card);
     const compactConsumption = formatCompactMoney(skipBalance ? null : hasAccountStats ? accountStats.todayCost : stats.cost, hasAccountStats ? provider.currency || balance.currency : stats.costCurrency || provider.currency);
     const compactBalance = formatCompactMoney(skipBalance ? null : balance.balance, provider.currency || balance.currency);
-    const reorder = providersCollapsed ? `<div class="provider-reorder-actions">${index > 0 ? '<button class="provider-reorder" data-direction="up" type="button" aria-label="上移站点" title="上移站点">↑</button>' : '<span></span>'}${index < appState.providers.length - 1 ? '<button class="provider-reorder" data-direction="down" type="button" aria-label="下移站点" title="下移站点">↓</button>' : '<span></span>'}</div>` : '';
-    card.innerHTML = `<div class="provider-compact-name" title="${escapeHtml(provider.name)}">${escapeHtml(provider.name)}</div><b class="provider-compact-consumption" title="今日消耗：${escapeHtml(compactConsumption)}">${escapeHtml(compactConsumption)}</b><span class="provider-compact-models" title="${provider.models?.length || 0}个模型">${provider.models?.length || 0}个模型</span><b class="provider-compact-balance" title="余额：${escapeHtml(compactBalance)}">${escapeHtml(compactBalance)}</b><span class="provider-compact-status" title="${statusLabel(provider)}" aria-label="${statusLabel(provider)}">${connectionIcon}</span><div class="provider-compact-actions">${reorder}<button class="provider-toggle compact-toggle" type="button" aria-label="展开 ${escapeHtml(provider.name)}">⌄</button></div>`;
+    card.innerHTML = `<div class="provider-compact-name" title="${escapeHtml(provider.name)}">${escapeHtml(provider.name)}</div><b class="provider-compact-consumption" title="今日消耗：${escapeHtml(compactConsumption)}">${escapeHtml(compactConsumption)}</b><span class="provider-compact-models" title="${provider.models?.length || 0}个模型">${provider.models?.length || 0}个模型</span><b class="provider-compact-balance" title="余额：${escapeHtml(compactBalance)}">${escapeHtml(compactBalance)}</b><span class="provider-compact-status" title="${statusLabel(provider)}" aria-label="${statusLabel(provider)}">${connectionIcon}</span><div class="provider-compact-actions"><button class="provider-toggle compact-toggle" type="button" aria-label="展开 ${escapeHtml(provider.name)}">⌄</button></div>`;
   } else {
     card.innerHTML = `<div class="provider-top"><div><div class="provider-name">${escapeHtml(provider.name)}</div><div class="provider-url">请求：${escapeHtml(displayUrl)}${provider.loginUrl && provider.loginUrl !== displayUrl ? `<br>登录：${escapeHtml(provider.loginUrl)}` : ''}</div></div><div class="provider-top-actions"><span class="badge ${provider.status}">${statusLabel(provider)} · ${provider.models?.length || 0} 个模型</span><button class="provider-toggle" type="button" aria-label="折叠 ${escapeHtml(provider.name)}">⌃</button></div></div>${skipBalance ? '' : `<div class="balance-line"><b>${amount}</b><span>${balanceLabel(provider)}</span></div><div class="balance-meta">剩余额度：${remaining}　查询：${escapeHtml(checked)}<br>余额接口：${balanceConnection}</div>`}<div class="provider-stats"><span>今日 Token：${todayTokens}</span><span>今日请求：${requests} 次</span><span>平均响应：${averageResponse}</span><span>今日消耗：${consumption}</span></div>${!skipBalance && balance.error ? `<div class="balance-error">${escapeHtml(balance.error)}</div>` : ''}${provider.error ? `<div class="balance-error">${escapeHtml(provider.error)}</div>` : ''}<div class="provider-actions">${connectButton}<button class="test">测试连接</button>${skipBalance ? '' : '<button class="refresh-balance">刷新余额</button>'}<button class="edit">编辑</button><button class="delete">删除</button></div>`;
   }
@@ -396,20 +416,6 @@ function render() {
       localStorage.setItem('api-pet-collapsed-provider-ids', JSON.stringify([...collapsedProviderIds]));
     }
     render();
-  });
-  card.querySelectorAll('.provider-reorder').forEach(button => {
-    button.addEventListener('click', async () => {
-      if (button.disabled || providerOrderSaving) return;
-      providerOrderSaving = true;
-      list.querySelectorAll('.provider-reorder').forEach(item => { item.disabled = true; });
-      try {
-        appState = await window.apiPet.moveProvider({ id: provider.id, direction: button.dataset.direction });
-        render();
-      } catch (error) {
-        list.querySelectorAll('.provider-reorder').forEach(item => { item.disabled = false; });
-        toast(`调整顺序失败：${error?.message || error}`);
-      } finally { providerOrderSaving = false; }
-    });
   });
   card.querySelector('.test')?.addEventListener('click', () => testProvider(provider.id));
     card.querySelector('.connect-account')?.addEventListener('click', () => connectProviderAccount(provider.id));
@@ -549,12 +555,32 @@ function renderMode() {
 function renderUnifiedRoute() {
   const route = appState.unifiedRoute || {};
   const provider = appState.providers.find(item => item.id === route.providerId);
-  const models = (provider?.models || []).slice().sort();
-  const format = route.format === 'chat/completions' ? 'chat/completions' : 'responses';
-  $('unifiedRoute').innerHTML = `<div class="unified-card"><div class="unified-field"><label>API<select id="unifiedProvider"><option value="">选择 API Provider</option>${appState.providers.map(item => `<option value="${item.id}" ${item.id === route.providerId ? 'selected' : ''}>${escapeHtml(item.name)}</option>`).join('')}</select></label></div><div class="unified-arrow">→</div><div class="unified-field"><label>模型<select id="unifiedTargetModel"><option value="">选择模型</option>${models.map(model => `<option value="${escapeHtml(model)}" ${model === route.model ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('')}</select></label></div><div class="unified-format"><label>上游格式<select id="unifiedFormat"><option value="responses" ${format === 'responses' ? 'selected' : ''}>responses</option><option value="chat/completions" ${format === 'chat/completions' ? 'selected' : ''}>chat/completions</option></select></label></div><div class="unified-caption">客户端模型为 <b>Pet model</b>；调用端点：<b>/v1/${escapeHtml(format)}</b></div></div>`;
-  $('unifiedProvider').onchange = async () => { appState = await window.apiPet.setUnifiedRoute({ providerId: $('unifiedProvider').value, model: '', format }); renderUnifiedRoute(); toast('API 已选择'); };
-  $('unifiedTargetModel').onchange = async () => { appState = await window.apiPet.setUnifiedRoute({ providerId: route.providerId, model: $('unifiedTargetModel').value, format }); renderUnifiedRoute(); toast('统一模型已保存'); };
-  $('unifiedFormat').onchange = async () => { appState = await window.apiPet.setUnifiedRoute({ providerId: route.providerId, model: route.model, format: $('unifiedFormat').value }); renderUnifiedRoute(); toast('上游格式已保存'); };
+  const keys = provider?.apiKeys || [];
+  const keyIndex = Object.prototype.hasOwnProperty.call(route, 'apiKey')
+    ? keys.findIndex(item => item.key === route.apiKey) : keys.findIndex(item => item.enabled !== false);
+  const models = keyIndex >= 0 ? [...new Set(route.models || provider?.models || [])].sort() : [];
+  $('unifiedRoute').innerHTML = `<div class="unified-card"><div class="unified-field"><label>站点<select id="unifiedProvider"><option value="">选择站点</option>${appState.providers.map(item => `<option value="${escapeHtml(item.id)}" ${item.id === route.providerId ? 'selected' : ''}>${escapeHtml(item.name)}</option>`).join('')}</select></label></div><div class="unified-field"><label>Key<select id="unifiedKeySelect"><option value="">${provider ? '选择 Key' : '先选择站点'}</option>${keys.map((item, index) => `<option value="${index}" ${index === keyIndex ? 'selected' : ''}>${escapeHtml(item.remark || `Key ${index + 1}`)}</option>`).join('')}</select></label></div><div class="unified-field"><label>模型<select id="unifiedTargetModel"><option value="">${unifiedRouteSaving ? '正在更新…' : keyIndex < 0 ? '先选择 Key' : models.length ? '选择模型' : '暂无可用模型'}</option>${models.map(model => `<option value="${escapeHtml(model)}" ${model === route.model ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('')}</select></label></div><div class="unified-caption">客户端模型为 <b>Pet model</b></div></div>`;
+  $('unifiedProvider').disabled = unifiedRouteSaving;
+  $('unifiedKeySelect').disabled = unifiedRouteSaving || !provider || !keys.length;
+  $('unifiedTargetModel').disabled = unifiedRouteSaving || !models.length;
+  $('unifiedProvider').onchange = () => saveUnifiedRoute({ providerId: $('unifiedProvider').value }, '站点已选择，请选择 Key');
+  $('unifiedKeySelect').onchange = () => saveUnifiedRoute({ providerId: route.providerId, keyIndex: $('unifiedKeySelect').value }, 'Key 已选择，模型列表已更新');
+  $('unifiedTargetModel').onchange = () => saveUnifiedRoute({ providerId: route.providerId, model: $('unifiedTargetModel').value }, '统一模型已保存');
+}
+async function saveUnifiedRoute(input, message) {
+  if (unifiedRouteSaving) return;
+  unifiedRouteSaving = true;
+  renderUnifiedRoute();
+  try {
+    appState = await window.apiPet.setUnifiedRoute(input);
+    toast(message);
+  } catch (error) {
+    try { appState = await window.apiPet.getState(); } catch {}
+    toast(`更新统一路由失败：${error.message}`);
+  } finally {
+    unifiedRouteSaving = false;
+    renderMode();
+  }
 }
 function renderRoutes() {
   const models = [...new Set(appState.providers.flatMap(provider => provider.models || []))].sort();
@@ -578,13 +604,20 @@ function fillProviderDialog(provider = {}) {
   renderTokenRows();
   $('accountToken').value = provider.accountToken || '';
   $('accountUserId').value = provider.accountUserId || '';
-  $('balanceAdapter').value = provider.balanceAdapter || 'sub2api';
+  const visibleProviderTypes = ['none', 'sub2api', 'new-api', 'aihub'];
+  $('balanceAdapter').value = visibleProviderTypes.includes(provider.balanceAdapter) ? provider.balanceAdapter : 'none';
   $('balanceUrl').value = provider.balanceUrl || '';
   $('balanceMethod').value = provider.balanceMethod || 'GET';
   $('balancePath').value = provider.balancePath || 'data.balance';
   $('remainingPath').value = provider.remainingPath || '';
-  $('currency').value = provider.currency || '$';
+  currencyDetectionToken += 1;
+  const currency = window.ProviderCurrency.currencySettings(provider);
+  $('currencyMode').value = currency.currencyMode;
+  $('currency').value = currency.currency;
+  draftDetectedCurrency = currency.detectedCurrency;
+  draftCurrencyDetection = currency.currencyDetection;
   updateProviderTypeFields();
+  if (currency.currencyMode === 'auto' && $('balanceAdapter').value !== 'none') detectProviderCurrency();
 }
 function updateProviderTypeFields() {
   const type = $('balanceAdapter').value;
@@ -595,6 +628,40 @@ function updateProviderTypeFields() {
   ['balanceUrlField', 'balanceMethodField', 'balancePathField', 'remainingPathField'].forEach(id => $(id)?.classList.toggle('hidden', supportsAccountLogin || skipBalance));
   $('currency').closest('label').classList.toggle('hidden', skipBalance);
   ['connectAccountInDialog', 'importProviderTokens'].forEach(id => $(id)?.classList.toggle('hidden', skipBalance));
+  updateCurrencyFields();
+}
+function updateCurrencyFields() {
+  const manual = $('currencyMode').value === 'manual';
+  $('currency').classList.toggle('hidden', !manual);
+  $('currency').required = manual && $('balanceAdapter').value !== 'none';
+  $('currencyStatus').textContent = manual ? '' : draftCurrencyDetection === 'detecting' ? '正在检测…'
+    : draftCurrencyDetection === 'detected' ? `已检测：${draftDetectedCurrency}`
+    : draftCurrencyDetection === 'failed' ? `未检测到币种，${draftDetectedCurrency ? `保留 ${draftDetectedCurrency}` : '暂用 $'}；可选择手动输入`
+    : '连接账户或刷新余额时检测';
+}
+async function detectProviderCurrency() {
+  if ($('currencyMode').value !== 'auto' || $('balanceAdapter').value === 'none') return;
+  const token = ++currencyDetectionToken;
+  const input = { ...collectProviderDraft(), id: editingId };
+  const signature = [editingId, input.loginUrl, input.balanceAdapter, input.accountToken, input.accountUserId].join('\n');
+  draftCurrencyDetection = 'detecting'; updateCurrencyFields();
+  try {
+    const result = await window.apiPet.detectProviderCurrency(input);
+    if (!dialog.open || [editingId, $('loginUrl').value.trim(), $('balanceAdapter').value, $('accountToken').value.trim(), $('accountUserId').value.trim()].join('\n') !== signature) return;
+    if (result.credentials) {
+      draftAccountData = { ...draftAccountData, ...result.credentials };
+      $('accountToken').value = result.credentials.accountToken || '';
+    }
+    if (token !== currencyDetectionToken || $('currencyMode').value !== 'auto') return;
+    draftCurrencyDetection = result.ok ? result.currencyDetection : 'failed';
+    if (result.detectedCurrency) { draftDetectedCurrency = result.detectedCurrency; $('currency').value = result.detectedCurrency; }
+  } catch { if (token === currencyDetectionToken) draftCurrencyDetection = 'failed'; }
+  finally {
+    if (token === currencyDetectionToken) {
+      if (draftCurrencyDetection === 'detecting') draftCurrencyDetection = 'pending';
+      updateCurrencyFields();
+    }
+  }
 }
 function ensureTokenRemarkField() {
   if ($('tokenFields')) return;
@@ -653,7 +720,7 @@ async function importProviderTokens() {
   button.disabled = true;
   button.textContent = '正在导入…';
   try {
-    const result = await window.apiPet.importProviderTokens(editingId || { provider: collectProviderDraft() });
+    const result = await window.apiPet.importProviderTokens({ provider: collectProviderDraft() });
     if (!result.ok) { toast(result.error || '导入令牌失败'); return; }
     if (result.credentials) {
       draftAccountData = { ...draftAccountData, ...result.credentials };
@@ -677,13 +744,16 @@ function collectProviderDraft() {
     name: $('providerName').value.trim(),
     loginUrl: $('loginUrl').value.trim(),
     requestUrl: $('requestUrl').value.trim(),
-    balanceAdapter: $('balanceAdapter').value || 'sub2api',
+    balanceAdapter: $('balanceAdapter').value || 'none',
     accountToken: $('accountToken').value.trim(),
-    accountRefreshToken: draftAccountData?.accountRefreshToken || '',
+    accountRefreshToken: draftAccountData?.accountRefreshToken || appState.providers.find(provider => provider.id === editingId)?.accountRefreshToken || '',
     accountUserId: $('accountUserId').value.trim(),
-    accountCookie: draftAccountData?.accountCookie || '',
-    accountSession: draftAccountData?.accountSession || '',
-    currency: $('currency').value
+    accountCookie: draftAccountData?.accountCookie || appState.providers.find(provider => provider.id === editingId)?.accountCookie || '',
+    accountSession: draftAccountData?.accountSession || appState.providers.find(provider => provider.id === editingId)?.accountSession || '',
+    currency: $('currency').value.trim(),
+    currencyMode: $('currencyMode').value,
+    detectedCurrency: draftDetectedCurrency,
+    currencyDetection: draftCurrencyDetection === 'detecting' ? 'pending' : draftCurrencyDetection
   };
 }
 function openEdit(provider) { editingId = provider.id; draftAccountData = null; $('dialogTitle').textContent = '编辑 Provider'; fillProviderDialog(provider); appRoot.classList.add('provider-dialog-open'); dialog.showModal(); }
@@ -692,7 +762,7 @@ async function saveProviderAndTest() {
   const form = $('providerForm');
   if (!form.reportValidity()) return;
   const apiKeys = providerTokenRows.map(row => ({ key: String(row.key || '').trim(), remark: String(row.remark || '').trim(), enabled: row.enabled !== false })).filter(row => row.key);
-  appState = await window.apiPet.saveProvider({ id: editingId, name: $('providerName').value, loginUrl: $('loginUrl').value, requestUrl: $('requestUrl').value, apiKeys, apiKey: apiKeys.find(row => row.enabled)?.key || apiKeys[0]?.key || '', tokenRemark: apiKeys.find(row => row.enabled)?.remark || '', accountToken: $('accountToken').value, accountRefreshToken: draftAccountData?.accountRefreshToken || '', accountCookie: draftAccountData?.accountCookie || '', accountSession: draftAccountData?.accountSession || '', accountUserId: $('accountUserId').value, accountStats: draftAccountData?.accountStats || null, balance: draftAccountData?.balance || null, balanceAdapter: $('balanceAdapter').value, balanceUrl: $('balanceUrl').value, balanceMethod: $('balanceMethod').value, balancePath: $('balancePath').value, remainingPath: $('remainingPath').value, currency: $('currency').value });
+  appState = await window.apiPet.saveProvider({ id: editingId, name: $('providerName').value, loginUrl: $('loginUrl').value, requestUrl: $('requestUrl').value, apiKeys, apiKey: apiKeys.find(row => row.enabled)?.key || apiKeys[0]?.key || '', tokenRemark: apiKeys.find(row => row.enabled)?.remark || '', accountToken: $('accountToken').value, accountRefreshToken: draftAccountData?.accountRefreshToken || '', accountCookie: draftAccountData?.accountCookie || '', accountSession: draftAccountData?.accountSession || '', accountUserId: $('accountUserId').value, accountStats: draftAccountData?.accountStats || null, balance: draftAccountData?.balance || null, balanceAdapter: $('balanceAdapter').value, balanceUrl: $('balanceUrl').value, balanceMethod: $('balanceMethod').value, balancePath: $('balancePath').value, remainingPath: $('remainingPath').value, currency: $('currency').value.trim(), currencyMode: $('currencyMode').value, detectedCurrency: draftDetectedCurrency, currencyDetection: draftCurrencyDetection === 'detecting' ? 'pending' : draftCurrencyDetection });
   dialog.close();
   render();
   const provider = appState.providers.find(item => item.id === editingId) || appState.providers.at(-1);
@@ -727,25 +797,34 @@ async function refreshBalance(id) {
     endManualBalanceQuery();
   }
 }
-async function connectProviderAccount(id, loginUrl = '', { silent = false } = {}) {
+async function connectProviderAccount(id, loginUrl = '', { silent = false, useDraft = false } = {}) {
   if (connectingAccounts === 0) connectionAnimationPlayed = false;
   connectingAccounts += 1;
   updatePetAnimation();
   if (!silent) toast('请在打开的窗口中登录站点账户…');
   try {
-    const result = await window.apiPet.connectProviderAccount(id ? { id, loginUrl } : { id: '', loginUrl, provider: collectProviderDraft() });
+    const result = await window.apiPet.connectProviderAccount(useDraft || !id
+      ? { id: id || '', loginUrl, provider: collectProviderDraft() } : { id, loginUrl });
     appState = result.state;
-    if (result.ok && !id && result.provider) {
+    if (result.ok && dialog.open && editingId === id && result.provider) {
       draftAccountData = result.provider;
       $('accountToken').value = result.provider.accountToken || '';
       $('accountUserId').value = result.provider.accountUserId || '';
       if (result.provider.balanceAdapter) {
         $('balanceAdapter').value = result.provider.balanceAdapter;
-        $('balanceAdapter').dispatchEvent(new Event('change'));
+        updateProviderTypeFields();
       }
     } else if (result.ok && editingId === id) {
       $('accountToken').value = appState.providers.find(provider => provider.id === id)?.accountToken || '';
       $('accountUserId').value = appState.providers.find(provider => provider.id === id)?.accountUserId || '';
+    }
+    if (result.ok && dialog.open && (!id || editingId === id)) {
+      currencyDetectionToken += 1;
+      const currency = window.ProviderCurrency.currencySettings(result.provider || appState.providers.find(provider => provider.id === id));
+      draftDetectedCurrency = currency.detectedCurrency;
+      draftCurrencyDetection = currency.currencyDetection;
+      if ($('currencyMode').value === 'auto') $('currency').value = currency.currency;
+      updateCurrencyFields();
     }
     render();
     if (!silent) toast(result.ok ? '账户已连接，余额和今日统计已更新' : `连接失败：${result.error}`);
@@ -784,7 +863,35 @@ async function refreshAllProviderAccounts() {
     button.disabled = appState.providers.every(provider => !['sub2api', 'new-api', 'aihub'].includes(provider.balanceAdapter));
   }
 }
+async function refreshAllProviderBalances() {
+  const providers = appState.providers.filter(provider => provider.balanceAdapter !== 'none');
+  if (!providers.length || refreshingAllBalances) return;
+  refreshingAllBalances = true;
+  updateBalanceRefreshButtons();
+  beginManualBalanceQuery();
+  toast('正在刷新所有站点余额…');
+  try {
+    appState = await window.apiPet.refreshAllBalances();
+    render();
+    const succeeded = providers.filter(provider => appState.providers.find(item => item.id === provider.id)?.balance?.apiStatus === 'online').length;
+    const failed = providers.length - succeeded;
+    toast(`余额刷新完成：成功 ${succeeded} 个，失败 ${failed} 个，跳过 ${appState.providers.filter(provider => provider.balanceAdapter === 'none').length} 个`);
+  } catch (error) {
+    try { appState = await window.apiPet.getState(); render(); } catch {}
+    toast(`余额刷新失败：${error?.message || error}`);
+  } finally {
+    refreshingAllBalances = false;
+    updateBalanceRefreshButtons();
+    endManualBalanceQuery();
+  }
+}
 let chatHistory = [];
+const chatReplyObjectUrls = new Set();
+function releaseChatReplyImages() {
+  for (const url of chatReplyObjectUrls) URL.revokeObjectURL(url);
+  chatReplyObjectUrls.clear();
+}
+window.addEventListener('unload', releaseChatReplyImages);
 function clearChatContext() {
   if (chatSending) return;
   chatHistory = [];
@@ -793,18 +900,18 @@ function clearChatContext() {
   empty.textContent = '输入消息，开始对话';
   $('chatMessages').replaceChildren(empty);
   document.querySelectorAll('.image-viewer').forEach(viewer => { viewer.close(); viewer.remove(); });
+  releaseChatReplyImages();
   toast('对话记录和上下文已清空');
   $('chatInput').focus();
 }
 function currentChatFormat() {
-  return appState?.routingMode === 'unified' && appState?.unifiedRoute?.format === 'chat/completions'
-    ? 'chat/completions' : 'responses';
+  return appState?.chatFormat === 'chat/completions' ? 'chat/completions' : 'responses';
 }
 function currentChatModel() {
-  if (chatModelSelection) return chatModelSelection;
-  if (chatSiteSelection) return '';
-  if (appState?.routingMode === 'unified') return 'Pet model';
-  return appState?.providers?.flatMap(provider => provider.models || [])[0] || '';
+  const site = getChatSite();
+  if (!site || currentChatKeyIndex() == null || chatModelsLoading
+      || chatFetchedProviderId !== site.id || chatFetchedKeyIndex !== currentChatKeyIndex()) return '';
+  return chatModelSelection;
 }
 function getChatSite() {
   const provider = appState?.providers?.find(item => item.id === chatSiteSelection);
@@ -822,7 +929,7 @@ function ensureChatTargetMenu() {
   if (!messages) return;
   const wrapper = document.createElement('div');
   wrapper.className = 'chat-targets';
-  wrapper.innerHTML = '<label class="chat-target-label">站点<select id="chatSite"><option value="">自动选择</option></select></label><label class="chat-target-label">Key<select id="chatKey"><option value="">先选择站点</option></select></label><label class="chat-target-label">模型<select id="chatModel"><option value="">自动选择</option></select></label>';
+  wrapper.innerHTML = '<label class="chat-target-label">站点<select id="chatSite"><option value="" disabled hidden>选择站点</option></select></label><label class="chat-target-label">Key<select id="chatKey"><option value="">先选择站点</option></select></label><label class="chat-target-label">模型<select id="chatModel"><option value="">先选择站点</option></select></label>';
   messages.before(wrapper);
   $('chatSite').onchange = async () => {
     chatSiteSelection = $('chatSite').value;
@@ -868,7 +975,7 @@ function ensureChatTargetMenu() {
       chatFetchedModels = models;
       chatFetchedProviderId = providerId;
       chatFetchedKeyIndex = keyIndex;
-      chatModelSelection = models[0] || (appState.routingMode === 'unified' ? 'Pet model' : '');
+      chatModelSelection = models[0] || '';
       localStorage.setItem('api-pet-chat-model', chatModelSelection);
       toast(`已获取 ${models.length} 个模型`);
     } catch (error) {
@@ -906,16 +1013,17 @@ function renderChatTargetMenu() {
   const keys = selectedSite?.apiKeys || (selectedSite?.apiKey ? [{ key: selectedSite.apiKey, remark: selectedSite.tokenRemark || '' }] : []);
   const keyIndex = currentChatKeyIndex();
   const hasFetchedSelection = chatFetchedProviderId === selectedSite?.id && chatFetchedKeyIndex === keyIndex;
-  const models = selectedSite
-    ? (hasFetchedSelection ? [...new Set(chatFetchedModels)].sort() : [])
-    : [...new Set(sites.flatMap(provider => provider.models || []))].sort();
-  if (appState.routingMode === 'unified') models.unshift('Pet model');
-  siteSelect.innerHTML = `<option value="">自动选择</option>${sites.map(provider => `<option value="${escapeHtml(provider.id)}">${escapeHtml(provider.name)}</option>`).join('')}`;
+  const models = selectedSite && keyIndex != null && hasFetchedSelection
+    ? [...new Set(chatFetchedModels)].sort() : [];
+  siteSelect.innerHTML = `<option value="" disabled hidden>${sites.length ? '选择站点' : '请先添加站点'}</option>${sites.map(provider => `<option value="${escapeHtml(provider.id)}">${escapeHtml(provider.name)}</option>`).join('')}`;
   keySelect.innerHTML = selectedSite
     ? `<option value="">选择 Key</option>${keys.map((key, index) => `<option value="${index}">${escapeHtml(key.remark || `Key ${index + 1}`)}</option>`).join('')}`
     : '<option value="">先选择站点</option>';
   keySelect.disabled = !selectedSite;
-  if (chatModelsLoading && selectedSite) {
+  if (!selectedSite) {
+    modelSelect.innerHTML = '<option value="">先选择站点</option>';
+    modelSelect.disabled = true;
+  } else if (chatModelsLoading) {
     modelSelect.innerHTML = '<option value="">正在获取模型…</option>';
     modelSelect.disabled = true;
   } else if (selectedSite && keyIndex == null) {
@@ -925,8 +1033,10 @@ function renderChatTargetMenu() {
     modelSelect.innerHTML = '<option value="">选择 Key 获取模型</option>';
     modelSelect.disabled = true;
   } else {
-    modelSelect.disabled = false;
-    modelSelect.innerHTML = `<option value="">自动选择</option>${models.map(model => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`).join('')}`;
+    modelSelect.disabled = !models.length;
+    modelSelect.innerHTML = models.length
+      ? models.map(model => `<option value="${escapeHtml(model)}">${escapeHtml(model)}</option>`).join('')
+      : '<option value="">暂无可用模型</option>';
   }
   chatSiteSelection = sites.some(provider => provider.id === chatSiteSelection) ? chatSiteSelection : '';
   chatModelSelection = models.includes(chatModelSelection) ? chatModelSelection : (models[0] || '');
@@ -936,9 +1046,7 @@ function renderChatTargetMenu() {
   if (chatSending) [siteSelect, keySelect, modelSelect].forEach(select => { select.disabled = true; });
 }
 function currentDrawingModel() {
-  const model = currentChatModel();
-  if (model !== 'Pet model') return model;
-  return (getChatSite() ? chatFetchedModels[0] || getChatSite().models?.[0] : appState?.unifiedRoute?.model) || '';
+  return currentChatModel();
 }
 function renderDrawingParameters() {
   let parameters = $('drawingParameters');
@@ -995,12 +1103,28 @@ function renderDrawingParameters() {
 function updateChatModelLabel() {
   const model = currentChatModel();
   const drawing = $('chatMode').value === 'image';
-  const format = drawing ? (chatImages.length ? '图生图' : '文生图') : `/v1/${currentChatFormat()}`;
   const enabled = Boolean(model);
   const site = getChatSite();
   const targetLabel = site ? `${site.name} · ${model}` : model;
-  $('chatModelLabel').textContent = enabled && model ? `${targetLabel} · ${format}` : '请先选择可用模型';
+  $('chatModelLabel').textContent = enabled && model
+    ? `${targetLabel}${drawing ? ` · ${chatImages.length ? '图生图' : '文生图'}` : ''}` : '请先选择可用模型';
+  $('chatModelLabel').title = $('chatModelLabel').textContent;
+  $('chatFormat').value = currentChatFormat();
+  $('chatFormat').classList.toggle('hidden', drawing);
+  $('chatFormat').disabled = chatSending || chatFormatSaving;
+  $('sendChat').disabled = chatSending || chatImagesLoading > 0 || !enabled || (!drawing && chatFormatSaving);
   renderDrawingParameters();
+}
+async function changeChatFormat() {
+  if (chatSending || chatFormatSaving) { updateChatModelLabel(); return; }
+  const previous = currentChatFormat();
+  const format = $('chatFormat').value;
+  chatFormatSaving = true;
+  appState.chatFormat = format;
+  updateChatMode();
+  try { appState.chatFormat = await window.apiPet.setChatFormat(format); }
+  catch (error) { appState.chatFormat = previous; toast(`保存对话格式失败：${error.message}`); }
+  finally { chatFormatSaving = false; updateChatMode(); }
 }
 function appendChatMessage(role, text, images = []) {
   const list = $('chatMessages');
@@ -1024,12 +1148,52 @@ function appendChatMessage(role, text, images = []) {
   return message;
 }
 function extractChatText(payload) {
-  if (typeof payload?.output_text === 'string' && payload.output_text.trim()) return payload.output_text;
-  const choice = payload?.choices?.[0]?.message?.content ?? payload?.choices?.[0]?.text;
-  if (typeof choice === 'string') return choice;
-  if (Array.isArray(choice)) return choice.map(item => item?.text || item?.content || '').join('');
-  if (Array.isArray(payload?.output)) return payload.output.flatMap(item => item?.content || []).map(item => item?.text || '').join('');
-  return '';
+  return ChatMessageParser.extractText(payload);
+}
+function renderChatReply(message, parsed) {
+  message.replaceChildren();
+  for (const segment of parsed.segments) {
+    if (segment.type === 'text') { message.appendChild(document.createTextNode(segment.text)); continue; }
+    const error = () => {
+      const label = document.createElement('span');
+      label.className = 'chat-inline-image-error';
+      label.textContent = '[图片无法显示]';
+      return label;
+    };
+    if (segment.type === 'image-error') { message.appendChild(error()); continue; }
+    const url = URL.createObjectURL(segment.blob);
+    chatReplyObjectUrls.add(url);
+    const preview = document.createElement('img');
+    preview.className = 'chat-inline-image';
+    preview.alt = segment.alt || '模型返回的图片';
+    preview.src = url;
+    preview.onerror = () => { preview.replaceWith(error()); URL.revokeObjectURL(url); chatReplyObjectUrls.delete(url); };
+    preview.onload = () => { $('chatMessages').scrollTop = $('chatMessages').scrollHeight; };
+    preview.oncontextmenu = async event => {
+      event.preventDefault();
+      try {
+        const bytes = await segment.blob.arrayBuffer();
+        const result = await window.apiPet.showInlineImageMenu({ bytes, mimeType: segment.mime });
+        if (!result.ok) throw new Error(result.error || '图片操作失败');
+        if (result.saved) toast('图片已保存');
+        else if (result.copied) toast('图片已复制');
+      } catch (error) { toast(`图片操作失败：${error.message}`); }
+    };
+    preview.onclick = () => {
+      const viewer = document.createElement('dialog');
+      viewer.className = 'image-viewer';
+      const full = document.createElement('img');
+      full.src = url; full.alt = preview.alt;
+      full.oncontextmenu = preview.oncontextmenu;
+      const close = document.createElement('button');
+      close.type = 'button'; close.className = 'icon'; close.textContent = '×'; close.setAttribute('aria-label', '关闭图片预览');
+      close.onclick = () => viewer.close();
+      viewer.append(close, full); document.body.appendChild(viewer);
+      viewer.onclose = () => viewer.remove(); viewer.showModal();
+    };
+    message.appendChild(preview);
+  }
+  $('chatMessages').scrollTop = $('chatMessages').scrollHeight;
 }
 async function sendChatMessage(text) {
   const model = currentChatModel();
@@ -1041,7 +1205,6 @@ async function sendChatMessage(text) {
     format,
     providerId,
     apiKeyIndex: currentChatKeyIndex(),
-    targetModel: model === 'Pet model' && chatFetchedModels.length ? chatFetchedModels[0] : '',
     messages: chatHistory.map(item => ({ role: item.role, content: item.content })),
     input: chatHistory.some(item => Array.isArray(item.content))
       ? chatHistory.map(item => ({ role: item.role, content: Array.isArray(item.content)
@@ -1054,15 +1217,14 @@ async function sendChatMessage(text) {
   const result = await window.apiPet.chatRequest(request);
   if (!result?.ok) throw new Error(result?.error || '直连请求失败');
   const payload = result.payload || {};
-  const answer = extractChatText(payload).trim();
-  if (!answer) throw new Error('模型返回了空内容');
-  return answer;
+  const parsed = ChatMessageParser.parseResponse(payload);
+  if (!parsed.historyText) throw new Error('模型返回了空内容');
+  return parsed;
 }
 function updateChatMode() {
   const imageMode = $('chatMode').value === 'image';
   chatPanel.classList.toggle('image-mode', imageMode);
   $('chatInput').placeholder = imageMode ? '描述你想生成的图片…' : '输入你的消息…';
-  $('sendChat').disabled = chatSending || chatImagesLoading > 0;
   $('clearChat').disabled = chatSending;
   $('chatMode').disabled = chatSending;
   $('addChatImage').disabled = chatSending;
@@ -1267,8 +1429,8 @@ async function handleChatSubmit(event) {
   try {
     const answer = await sendChatMessage(text);
     pending.className = 'chat-message assistant';
-    pending.textContent = answer;
-    chatHistory.push({ role: 'assistant', content: answer });
+    renderChatReply(pending, answer);
+    chatHistory.push({ role: 'assistant', content: answer.historyText });
   } catch (error) {
     pending.className = 'chat-message error';
     pending.textContent = error.message || '请求失败';
@@ -1306,8 +1468,17 @@ window.addEventListener('DOMContentLoaded', async () => {
   $('openChat').onclick = () => setChatVisible(chatPanel.classList.contains('hidden'));
   $('openSettings').onclick = () => setPanelVisible(panel.classList.contains('hidden'));
   $('chatForm').onsubmit = handleChatSubmit;
+  $('chatInput').onkeydown = event => {
+    if (event.key !== 'Enter' || !event.ctrlKey || event.altKey || event.metaKey || event.shiftKey
+        || event.isComposing || event.keyCode === 229) return;
+    event.preventDefault();
+    if (event.repeat || document.activeElement !== event.currentTarget || chatPanel.classList.contains('hidden')
+        || $('sendChat').disabled) return;
+    $('chatForm').requestSubmit($('sendChat'));
+  };
   $('clearChat').onclick = clearChatContext;
   $('chatMode').onchange = updateChatMode;
+  $('chatFormat').onchange = changeChatFormat;
   setupChatImageUpload();
   updateChatMode();
   $('closeChat').onclick = () => setChatVisible(false);
@@ -1328,22 +1499,22 @@ window.addEventListener('DOMContentLoaded', async () => {
   $('copyUrl').onclick = () => copyGatewayValue('unifiedUrl', 'URL');
   $('copyKey').onclick = () => copyGatewayValue('unifiedKey', '统一 Key');
   $('copyModel').onclick = () => copyGatewayValue('unifiedModel', 'Pet 模型');
-  $('refreshAllBalances').onclick = async () => {
-    beginManualBalanceQuery();
-    toast('正在刷新余额…');
-    try {
-      appState = await window.apiPet.refreshAllBalances();
-      render();
-      toast('余额信息已更新');
-    } finally {
-      endManualBalanceQuery();
-    }
-  };
+  $('refreshAllBalances').onclick = refreshAllProviderBalances;
   $('saveBalanceSettings').onclick = async () => { appState = await window.apiPet.setBalanceSettings({ lowThreshold: $('lowThreshold').value, refreshMinutes: $('refreshMinutes').value }); render(); toast('余额设置已保存'); };
   $('routingEnabled').onchange = async () => { appState = await window.apiPet.setRoutingEnabled($('routingEnabled').checked); renderMode(); toast(appState.routingEnabled ? '已启用模型路由' : '已关闭模型路由'); };
   $('routingMode').onchange = async () => { appState = await window.apiPet.setRoutingMode($('routingMode').value); renderMode(); toast($('routingMode').value === 'unified' ? '已切换到统一路由模式' : '已切换到模型路由模式'); };
-  $('balanceAdapter').onchange = updateProviderTypeFields;
-  $('connectAccountInDialog').onclick = () => connectProviderAccount(editingId, $('loginUrl').value.trim());
+  $('balanceAdapter').onchange = () => { currencyDetectionToken += 1; draftCurrencyDetection = 'pending'; updateProviderTypeFields(); detectProviderCurrency(); };
+  $('currencyMode').onchange = () => { currencyDetectionToken += 1; updateCurrencyFields(); detectProviderCurrency(); };
+  ['loginUrl', 'accountToken', 'accountUserId'].forEach(id => {
+    $(id).addEventListener('change', () => {
+      currencyDetectionToken += 1;
+      draftDetectedCurrency = '';
+      draftCurrencyDetection = 'pending';
+      updateCurrencyFields();
+      detectProviderCurrency();
+    });
+  });
+  $('connectAccountInDialog').onclick = () => connectProviderAccount(editingId, $('loginUrl').value.trim(), { useDraft: true });
   ensureTokenRemarkField();
   $('providerForm').onsubmit = event => event.preventDefault();
   $('saveProvider').type = 'button';
@@ -1353,6 +1524,7 @@ window.addEventListener('DOMContentLoaded', async () => {
     button.onclick = () => dialog.close('cancel');
   });
   dialog.addEventListener('close', () => {
+    currencyDetectionToken += 1;
     appRoot.classList.remove('provider-dialog-open');
     $('dialogToast')?.classList.remove('show');
   });

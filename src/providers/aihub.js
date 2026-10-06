@@ -1,4 +1,4 @@
-const { notConfigured, accountFetch } = require('./base');
+const { notConfigured, accountFetch, balanceCurrency } = require('./base');
 
 const MICRO_PER_DOLLAR = 1000000;
 
@@ -80,7 +80,7 @@ module.exports = {
       return {
         balance: balanceMicro / MICRO_PER_DOLLAR,
         remaining: null,
-        currency: provider.currency || '$',
+        ...balanceCurrency(provider, [body], '$'),
         ...(summary && typeof summary === 'object' && !Array.isArray(summary) ? { accountStats: {
           todayCost: costMicro == null ? null : costMicro / MICRO_PER_DOLLAR,
           todayRequests: parseNumber(summary.requests),

@@ -56,6 +56,61 @@ test('explicit quality, endpoint choice, Gemini auto ratio and Grok JSON single 
   assert.equal(fields(build({ model: 'grok-imagine-image', quality: 'high', referenceImages: [reference] })).quality, undefined);
 });
 
+test('new image model names are classified by series prefix', () => {
+  const cases = [
+    ['gpt-new-image', 'generic'],
+    ['gemini-4-image-preview', 'gemini'],
+    ['grok-new-image-v3', 'grok'],
+    ['grok-imagine-image-2.0', 'grok-json'],
+    ['seedream-v6-pro', 'seedream'],
+    ['sensenova-u2-image', 'sense-lite'],
+    ['sensenova-u1-fast', 'sense-fast'],
+    ['unknown-image-family', 'generic']
+  ];
+  for (const [model, expected] of cases) {
+    const source = buildRequest('https://example.invalid/v1', 'test-only', { ...defaults, model });
+    assert.equal(source.kind, expected, model);
+  }
+});
+
+test('new prefixed models use their family request templates', () => {
+  const gemini = build({ model: 'gemini-4-image-preview', resolution: '1K', ratio: '16:9' });
+  assert.match(gemini.url, /\/v1beta\/models\/gemini-4-image-preview:generateContent$/);
+  assert.deepEqual(fields(gemini).generationConfig.imageConfig, { imageSize: '1K', aspectRatio: '16:9' });
+
+  const seedream = build({ model: 'seedream-v6-pro' });
+  assert.ok(seedream.url.endsWith('/images/generations'));
+  assert.equal(fields(seedream).output_format, 'png');
+  assert.equal(fields(seedream).response_format, 'b64_json');
+  const seedreamEdit = build({ model: 'seedream-v6-pro', referenceImages: [reference] });
+  assert.ok(seedreamEdit.url.endsWith('/images/edits'));
+  assert.equal(seedreamEdit.init.body.getAll('image[]').length, 1);
+
+  const grok = build({ model: 'grok-new-image-v3' });
+  assert.ok(grok.url.endsWith('/images/generations'));
+  assert.equal(fields(grok).aspect_ratio, '1:1');
+  assert.equal(fields(grok).response_format, 'b64_json');
+  const grokEdit = build({ model: 'grok-new-image-v3', referenceImages: [reference, reference] });
+  assert.ok(grokEdit.url.endsWith('/images/edits'));
+  assert.equal(grokEdit.init.body.getAll('image[]').length, 2);
+
+  const sense = build({ model: 'sensenova-u2-image' });
+  assert.ok(sense.url.endsWith('/images/generations'));
+  assert.equal(fields(sense).watermark, true);
+  assert.equal(fields(sense).prompt_extend, true);
+  assert.equal(fields(sense).output_format, 'png');
+  const senseEdit = build({ model: 'sensenova-u2-image', referenceImages: [reference, reference] });
+  assert.ok(senseEdit.url.endsWith('/images/edits'));
+  assert.deepEqual(fields(senseEdit).images, [{ image_url: reference }, { image_url: reference }]);
+
+  assert.throws(() => build({ model: 'sensenova-u1-fast', referenceImages: [reference] }), /不支持/);
+});
+
+test('new SenseNova lite models inherit size constraints', () => {
+  const custom = getImageSizeSelection({ model: 'sensenova-u2-image', resolution: 'custom', width: 4096, height: 512 });
+  assert.equal(custom.size, '1536x512');
+});
+
 test('model constraints and size changes', () => {
   assert.throws(() => build({ referenceImages: Array(5).fill(reference) }), /最多/);
   assert.throws(() => build({ referenceImages: ['bad'] }), /格式/);

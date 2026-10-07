@@ -79,7 +79,6 @@ module.exports = {
       const costMicro = parseNumber(summary?.cost_micro);
       return {
         balance: balanceMicro / MICRO_PER_DOLLAR,
-        remaining: null,
         ...balanceCurrency(provider, [body], '$'),
         ...(summary && typeof summary === 'object' && !Array.isArray(summary) ? { accountStats: {
           todayCost: costMicro == null ? null : costMicro / MICRO_PER_DOLLAR,

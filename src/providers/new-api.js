@@ -198,7 +198,7 @@ function todayStart() {
 }
 
 function statsFromPayload(stats, logs) {
-  const todayCost = normalizeCost(findNumber(stats, ['today_cost', 'todayCost', 'today_spend', 'todaySpend', 'daily_cost', 'dailyCost']));
+  const todayCost = normalizeCost(findNumber(stats, ['today_cost', 'todayCost', 'today_spend', 'todaySpend', 'daily_cost', 'dailyCost', 'today_quota', 'todayQuota']));
   const todayRequests = parseNumber(findNumber(stats, ['today_requests', 'todayRequests', 'today_request_count', 'todayRequestCount', 'request_count', 'requestCount', 'requests']));
   const todayTokens = parseNumber(findNumber(stats, ['today_tokens', 'todayTokens', 'total_tokens', 'totalTokens', 'tokens']));
   const averageDurationMs = normalizeDuration(findNumber(stats, ['average_duration_ms', 'averageDurationMs', 'avg_duration_ms', 'avgDurationMs', 'average_latency', 'avg_latency']));
@@ -211,19 +211,36 @@ function statsFromPayload(stats, logs) {
     return !Number.isFinite(timestamp) || timestamp >= todayStart();
   });
   const rows = today.length ? today : entries;
-  const sum = keys => rows.reduce((total, row) => {
+  const usageRows = rows.filter(row => {
+    const type = parseNumber(row?.type);
+    if (type != null) return type === 2;
+    return ['quota', 'cost', 'spend', 'amount', 'prompt_tokens', 'completion_tokens', 'total_tokens', 'tokens']
+      .some(key => parseNumber(row?.[key]) > 0);
+  });
+  const countedRows = usageRows.length ? usageRows : rows;
+  const usageSum = keys => countedRows.reduce((total, row) => {
     const raw = keys.map(key => row?.[key]).find(value => value != null);
     return total + (parseNumber(raw) || 0);
   }, 0);
-  const logCost = rows.length ? normalizeCost(sum(['cost', 'quota', 'spend', 'amount'])) : null;
-  const logTokens = rows.length ? sum(['total_tokens', 'totalTokens', 'tokens', 'input_tokens', 'output_tokens']) : null;
-  const durations = rows.map(row => normalizeDuration(row?.duration_ms ?? row?.durationMs ?? row?.duration ?? row?.latency_ms)).filter(Number.isFinite);
+  const logCost = countedRows.length ? normalizeCost(usageSum(['cost', 'quota', 'spend', 'amount'])) : null;
+  const logTokens = countedRows.length ? countedRows.reduce((total, row) => {
+    const combined = parseNumber(row?.total_tokens ?? row?.totalTokens);
+    return total + (combined != null ? combined : (parseNumber(row?.prompt_tokens ?? row?.input_tokens) || 0) + (parseNumber(row?.completion_tokens ?? row?.output_tokens) || 0));
+  }, 0) : null;
+  const durations = countedRows.map(row => normalizeDuration(row?.duration_ms ?? row?.durationMs ?? row?.duration ?? row?.use_time ?? row?.latency_ms)).filter(Number.isFinite);
   return {
     todayCost: todayCost ?? (logCost > 0 ? logCost : null),
-    todayRequests: todayRequests ?? rows.length,
+    todayRequests: todayRequests ?? countedRows.length,
     todayTokens: todayTokens ?? (logTokens > 0 ? logTokens : null),
     averageDurationMs: averageDurationMs ?? (durations.length ? durations.reduce((a, b) => a + b, 0) / durations.length : null)
   };
+}
+
+async function getTodayLogs(origin, request, controller) {
+  const start = Math.floor(todayStart() / 1000);
+  const end = Math.floor(Date.now() / 1000) + 1;
+  const query = new URLSearchParams({ p: '1', page_size: '100', start_timestamp: String(start), end_timestamp: String(end) });
+  return getJson(`${origin}/api/log/self?${query}`, request.headers, controller.signal, 'GET', request.refresh);
 }
 
 module.exports = {
@@ -299,11 +316,13 @@ module.exports = {
         getJson(`${origin}/api/performance/stats`, request.headers, controller.signal, 'GET', request.refresh).then(value => { stats = value; }).catch(() => {}),
         getJson(`${origin}/api/performance/logs`, request.headers, controller.signal, 'GET', request.refresh).then(value => { logs = value; }).catch(() => {})
       ]);
+      if (!findCollection(logs, ['logs', 'items', 'records'])?.length) {
+        logs = await getTodayLogs(origin, request, controller).catch(() => null);
+      }
       const parsedStats = statsFromPayload(stats, logs);
       const accountStats = Object.fromEntries(Object.entries(parsedStats).filter(([, value]) => value != null && Number.isFinite(Number(value))));
       return {
         balance,
-        remaining: quotaAmount(findNumber(user, ['remaining_quota', 'remainingQuota'])) ?? balance,
         ...balanceCurrency(provider, [user, profile], Math.abs(rawBalance) >= 10000 ? '$' : ''),
         ...(Object.keys(accountStats).length ? { accountStats } : {})
       };

@@ -73,3 +73,33 @@ test('New API balance and token imports also use the account network transport',
   assert.equal((await adapter.getApiKeys(record))[0].key, 'sk-test-key');
   assert.equal(calls.length, 5);
 });
+
+test('New API user logs provide today usage when performance stats are admin-only', async () => {
+  const now = Math.floor(Date.now() / 1000);
+  const adapterSource = fs.readFileSync(path.join(__dirname, '../src/providers/new-api.js'), 'utf8');
+  const items = [
+    { type: 2, created_at: now, quota: 28125, prompt_tokens: 5, completion_tokens: 2048, use_time: 15 },
+    { type: 2, created_at: now, quota: 28125, prompt_tokens: 582, completion_tokens: 2048, use_time: 18 },
+    { type: 2, created_at: now, quota: 28125, prompt_tokens: 649, completion_tokens: 2048, use_time: 15 },
+    { type: 2, created_at: now, quota: 25000, prompt_tokens: 649, completion_tokens: 2048, use_time: 26 },
+    { type: 2, created_at: now, quota: 5000, prompt_tokens: 639, completion_tokens: 1158, use_time: 21 },
+    { type: 5, created_at: now, quota: 0, prompt_tokens: 0, completion_tokens: 0, use_time: 0 }
+  ];
+  const context = vm.createContext({
+    module: { exports: {} }, URL, URLSearchParams, AbortController, setTimeout, clearTimeout, Date,
+    require: () => ({ ...require('../src/providers/base'), accountFetch: async (url, options) => {
+      const request = new URL(url);
+      const reply = (body, status = 200) => new Response(JSON.stringify(body), { status });
+      if (request.pathname === '/api/user/self') return reply({ success: true, data: { quota: 500000 } });
+      if (request.pathname.startsWith('/api/performance/')) return reply({ message: 'admin only' }, 403);
+      if (request.pathname === '/api/log/self') return reply({ success: true, data: { page: 1, page_size: 100, total: items.length, items } });
+      throw new Error(`unexpected request: ${request.pathname}`);
+    } })
+  });
+  vm.runInContext(adapterSource, context);
+  const result = await context.module.exports.getBalance({ loginUrl: 'https://account.test', accountToken: 'test-token', accountUserId: '123' });
+  assert.equal(result.accountStats.todayRequests, 5);
+  assert.equal(result.accountStats.todayTokens, 11874);
+  assert.equal(result.accountStats.todayCost, 0.22875);
+  assert.equal(result.accountStats.averageDurationMs, 19000);
+});

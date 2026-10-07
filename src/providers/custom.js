@@ -25,9 +25,7 @@ module.exports = {
       const raw = valueAtPath(body, provider.balancePath || 'data.balance');
       const balance = typeof raw === 'number' ? raw : Number(String(raw ?? '').replace(/[, ]/g, ''));
       if (!Number.isFinite(balance)) throw new Error(`余额字段不是数字，请检查响应字段路径：${provider.balancePath || 'data.balance'}`);
-      const remainingRaw = provider.remainingPath ? valueAtPath(body, provider.remainingPath) : undefined;
-      const remaining = remainingRaw == null || remainingRaw === '' ? null : Number(String(remainingRaw).replace(/[, ]/g, ''));
-      return { balance, remaining: Number.isFinite(remaining) ? remaining : null,
+      return { balance,
         ...balanceCurrency(provider, [body, { currency: response.headers?.get?.('x-currency') }]) };
     } finally {
       clearTimeout(timer);

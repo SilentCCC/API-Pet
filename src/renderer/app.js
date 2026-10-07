@@ -375,7 +375,6 @@ function render() {
     const balance = provider.balance || {};
     const skipBalance = provider.balanceAdapter === 'none';
     const amount = skipBalance ? '不查询' : balance.balance == null ? '--' : `${escapeHtml(provider.currency || balance.currency || '$')}${Number(balance.balance).toFixed(4)}`;
-    const remaining = balance.remaining == null ? '--' : Number(balance.remaining).toFixed(2);
     const checked = balance.updatedAt ? new Date(balance.updatedAt).toLocaleString() : '尚未查询';
     const stats = provider.dailyStats || {};
     const accountStats = skipBalance ? {} : provider.accountStats || {};
@@ -401,7 +400,7 @@ function render() {
     const compactBalance = formatCompactMoney(skipBalance ? null : balance.balance, provider.currency || balance.currency);
     card.innerHTML = `<div class="provider-compact-name" title="${escapeHtml(provider.name)}">${escapeHtml(provider.name)}</div><b class="provider-compact-consumption" title="今日消耗：${escapeHtml(compactConsumption)}">${escapeHtml(compactConsumption)}</b><span class="provider-compact-models" title="${provider.models?.length || 0}个模型">${provider.models?.length || 0}个模型</span><b class="provider-compact-balance" title="余额：${escapeHtml(compactBalance)}">${escapeHtml(compactBalance)}</b><span class="provider-compact-status" title="${statusLabel(provider)}" aria-label="${statusLabel(provider)}">${connectionIcon}</span><div class="provider-compact-actions"><button class="provider-toggle compact-toggle" type="button" aria-label="展开 ${escapeHtml(provider.name)}">⌄</button></div>`;
   } else {
-    card.innerHTML = `<div class="provider-top"><div><div class="provider-name">${escapeHtml(provider.name)}</div><div class="provider-url">请求：${escapeHtml(displayUrl)}${provider.loginUrl && provider.loginUrl !== displayUrl ? `<br>登录：${escapeHtml(provider.loginUrl)}` : ''}</div></div><div class="provider-top-actions"><span class="badge ${provider.status}">${statusLabel(provider)} · ${provider.models?.length || 0} 个模型</span><button class="provider-toggle" type="button" aria-label="折叠 ${escapeHtml(provider.name)}">⌃</button></div></div>${skipBalance ? '' : `<div class="balance-line"><b>${amount}</b><span>${balanceLabel(provider)}</span></div><div class="balance-meta">剩余额度：${remaining}　查询：${escapeHtml(checked)}<br>余额接口：${balanceConnection}</div>`}<div class="provider-stats"><span>今日 Token：${todayTokens}</span><span>今日请求：${requests} 次</span><span>平均响应：${averageResponse}</span><span>今日消耗：${consumption}</span></div>${!skipBalance && balance.error ? `<div class="balance-error">${escapeHtml(balance.error)}</div>` : ''}${provider.error ? `<div class="balance-error">${escapeHtml(provider.error)}</div>` : ''}<div class="provider-actions">${connectButton}<button class="test">测试连接</button>${skipBalance ? '' : '<button class="refresh-balance">刷新余额</button>'}<button class="edit">编辑</button><button class="delete">删除</button></div>`;
+    card.innerHTML = `<div class="provider-top"><div><div class="provider-name">${escapeHtml(provider.name)}</div><div class="provider-url">请求：${escapeHtml(displayUrl)}${provider.loginUrl && provider.loginUrl !== displayUrl ? `<br>登录：${escapeHtml(provider.loginUrl)}` : ''}</div></div><div class="provider-top-actions"><span class="badge ${provider.status}">${statusLabel(provider)} · ${provider.models?.length || 0} 个模型</span><button class="provider-toggle" type="button" aria-label="折叠 ${escapeHtml(provider.name)}">⌃</button></div></div>${skipBalance ? '' : `<div class="balance-line"><b>${amount}</b><span>${balanceLabel(provider)}</span></div><div class="balance-meta">查询：${escapeHtml(checked)}<br>余额接口：${balanceConnection}</div>`}<div class="provider-stats"><span>今日 Token：${todayTokens}</span><span>今日请求：${requests} 次</span><span>平均响应：${averageResponse}</span><span>今日消耗：${consumption}</span></div>${!skipBalance && balance.error ? `<div class="balance-error">${escapeHtml(balance.error)}</div>` : ''}${provider.error ? `<div class="balance-error">${escapeHtml(provider.error)}</div>` : ''}<div class="provider-actions">${connectButton}<button class="test">测试连接</button>${skipBalance ? '' : '<button class="refresh-balance">刷新余额</button>'}<button class="edit">编辑</button><button class="delete">删除</button><button class="open-login">登录站点</button></div>`;
   }
   card.querySelector('.provider-toggle')?.addEventListener('click', () => {
     if (providersCollapsed) {
@@ -422,6 +421,7 @@ function render() {
     card.querySelector('.refresh-balance')?.addEventListener('click', () => refreshBalance(provider.id));
     card.querySelector('.edit')?.addEventListener('click', () => openEdit(provider));
     card.querySelector('.delete')?.addEventListener('click', async () => { if (confirm('删除这个 Provider？')) { appState = await window.apiPet.deleteProvider(provider.id); render(); } });
+    card.querySelector('.open-login')?.addEventListener('click', () => connectProviderAccount(provider.id, provider.loginUrl || provider.baseUrl || provider.requestUrl || '', { keepWindowOpen: true }));
     list.appendChild(card);
   });
   updateCompactMoneyColumns();
@@ -609,7 +609,6 @@ function fillProviderDialog(provider = {}) {
   $('balanceUrl').value = provider.balanceUrl || '';
   $('balanceMethod').value = provider.balanceMethod || 'GET';
   $('balancePath').value = provider.balancePath || 'data.balance';
-  $('remainingPath').value = provider.remainingPath || '';
   currencyDetectionToken += 1;
   const currency = window.ProviderCurrency.currencySettings(provider);
   $('currencyMode').value = currency.currencyMode;
@@ -625,7 +624,7 @@ function updateProviderTypeFields() {
   const supportsAccountLogin = ['sub2api', 'new-api', 'aihub'].includes(type);
   $('accountTokenField').classList.toggle('hidden', !supportsAccountLogin);
   $('accountUserIdField').classList.toggle('hidden', type !== 'new-api');
-  ['balanceUrlField', 'balanceMethodField', 'balancePathField', 'remainingPathField'].forEach(id => $(id)?.classList.toggle('hidden', supportsAccountLogin || skipBalance));
+  ['balanceUrlField', 'balanceMethodField', 'balancePathField'].forEach(id => $(id)?.classList.toggle('hidden', supportsAccountLogin || skipBalance));
   $('currency').closest('label').classList.toggle('hidden', skipBalance);
   ['connectAccountInDialog', 'importProviderTokens'].forEach(id => $(id)?.classList.toggle('hidden', skipBalance));
   updateCurrencyFields();
@@ -762,7 +761,7 @@ async function saveProviderAndTest() {
   const form = $('providerForm');
   if (!form.reportValidity()) return;
   const apiKeys = providerTokenRows.map(row => ({ key: String(row.key || '').trim(), remark: String(row.remark || '').trim(), enabled: row.enabled !== false })).filter(row => row.key);
-  appState = await window.apiPet.saveProvider({ id: editingId, name: $('providerName').value, loginUrl: $('loginUrl').value, requestUrl: $('requestUrl').value, apiKeys, apiKey: apiKeys.find(row => row.enabled)?.key || apiKeys[0]?.key || '', tokenRemark: apiKeys.find(row => row.enabled)?.remark || '', accountToken: $('accountToken').value, accountRefreshToken: draftAccountData?.accountRefreshToken || '', accountCookie: draftAccountData?.accountCookie || '', accountSession: draftAccountData?.accountSession || '', accountUserId: $('accountUserId').value, accountStats: draftAccountData?.accountStats || null, balance: draftAccountData?.balance || null, balanceAdapter: $('balanceAdapter').value, balanceUrl: $('balanceUrl').value, balanceMethod: $('balanceMethod').value, balancePath: $('balancePath').value, remainingPath: $('remainingPath').value, currency: $('currency').value.trim(), currencyMode: $('currencyMode').value, detectedCurrency: draftDetectedCurrency, currencyDetection: draftCurrencyDetection === 'detecting' ? 'pending' : draftCurrencyDetection });
+  appState = await window.apiPet.saveProvider({ id: editingId, name: $('providerName').value, loginUrl: $('loginUrl').value, requestUrl: $('requestUrl').value, apiKeys, apiKey: apiKeys.find(row => row.enabled)?.key || apiKeys[0]?.key || '', tokenRemark: apiKeys.find(row => row.enabled)?.remark || '', accountToken: $('accountToken').value, accountRefreshToken: draftAccountData?.accountRefreshToken || '', accountCookie: draftAccountData?.accountCookie || '', accountSession: draftAccountData?.accountSession || '', accountUserId: $('accountUserId').value, accountStats: draftAccountData?.accountStats || null, balance: draftAccountData?.balance || null, balanceAdapter: $('balanceAdapter').value, balanceUrl: $('balanceUrl').value, balanceMethod: $('balanceMethod').value, balancePath: $('balancePath').value, currency: $('currency').value.trim(), currencyMode: $('currencyMode').value, detectedCurrency: draftDetectedCurrency, currencyDetection: draftCurrencyDetection === 'detecting' ? 'pending' : draftCurrencyDetection });
   dialog.close();
   render();
   const provider = appState.providers.find(item => item.id === editingId) || appState.providers.at(-1);
@@ -797,14 +796,17 @@ async function refreshBalance(id) {
     endManualBalanceQuery();
   }
 }
-async function connectProviderAccount(id, loginUrl = '', { silent = false, useDraft = false } = {}) {
+async function connectProviderAccount(id, loginUrl = '', { silent = false, useDraft = false, keepWindowOpen = false } = {}) {
   if (connectingAccounts === 0) connectionAnimationPlayed = false;
   connectingAccounts += 1;
   updatePetAnimation();
   if (!silent) toast('请在打开的窗口中登录站点账户…');
   try {
-    const result = await window.apiPet.connectProviderAccount(useDraft || !id
-      ? { id: id || '', loginUrl, provider: collectProviderDraft() } : { id, loginUrl });
+    const input = useDraft || !id
+      ? { id: id || '', loginUrl, provider: collectProviderDraft() } : { id, loginUrl };
+    const result = keepWindowOpen
+      ? await window.apiPet.openProviderLogin(input)
+      : await window.apiPet.connectProviderAccount(input);
     appState = result.state;
     if (result.ok && dialog.open && editingId === id && result.provider) {
       draftAccountData = result.provider;

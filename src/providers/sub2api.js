@@ -199,7 +199,6 @@ module.exports = {
       const todayRequests = parseNumber(stats?.today_requests);
       return {
         balance,
-        remaining: null,
         ...balanceCurrency(provider, [user, profile, stats]),
         ...(stats ? { accountStats: {
           todayCost,

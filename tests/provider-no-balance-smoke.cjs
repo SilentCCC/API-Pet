@@ -141,7 +141,7 @@ async function run() {
   assert.equal(await execute(`document.querySelector('#balanceAdapter').value`), 'none', 'Legacy custom sites use a supported choice when editing');
   assert.equal(await execute(`document.querySelector('.app').classList.contains('provider-dialog-open') && getComputedStyle(document.querySelector('#pet')).display !== 'none' && getComputedStyle(document.querySelector('#pet')).pointerEvents === 'none' && getComputedStyle(document.querySelector('.pet-image')).webkitAppRegion !== 'drag'`), true, 'Provider dialog keeps the pet visible without its draggable hit region');
   await execute(`document.querySelector('#balanceAdapter').value = 'none'; document.querySelector('#balanceAdapter').dispatchEvent(new Event('change'))`);
-  const fields = ['balanceUrlField', 'balanceMethodField', 'balancePathField', 'remainingPathField', 'accountTokenField', 'accountUserIdField', 'connectAccountInDialog', 'importProviderTokens'];
+  const fields = ['balanceUrlField', 'balanceMethodField', 'balancePathField', 'accountTokenField', 'accountUserIdField', 'connectAccountInDialog', 'importProviderTokens'];
   const hidden = async () => execute(`(${JSON.stringify(fields)}).every(id => getComputedStyle(document.getElementById(id)).display === 'none') && getComputedStyle(document.getElementById('currency').closest('label')).display === 'none'`);
   assert.equal(await hidden(), true);
   assert.equal(await execute(`document.querySelector('#balanceAdapter').value`), 'none');

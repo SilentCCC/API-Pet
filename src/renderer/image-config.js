@@ -6,25 +6,6 @@
 const DEFAULT_IMAGE_MODEL = "gpt-image-2";
 const CUSTOM_IMAGE_RESOLUTION = "custom";
 const AUTO_IMAGE_RESOLUTION = "auto";
-const SUPPORTED_IMAGE_MODELS = [
-  DEFAULT_IMAGE_MODEL,
-  "grok-imagine-image",
-  "grok-imagine-image-2.0",
-  "grok-imagine-image-quality",
-  "grok4.3-img",
-  "grok4.5-img",
-  "sensenova-u1.5-lite",
-  "sensenova-u1-fast",
-  "seedream-v5-lite",
-  "seedream-v5-pro",
-  "gemini-3-pro-image-preview",
-  "gemini-3.1-flash-image-preview",
-  "gemini-3-pro-image",
-  "gemini-3.1-flash-image",
-  "gemini-2.5-flash-image-preview",
-  "gemini-2.5-flash-image"
-];
-
 const IMAGE_SIZE_CONFIG = {
   [DEFAULT_IMAGE_MODEL]: {
     resolutions: [AUTO_IMAGE_RESOLUTION, "1K", "2K", "4K"],
@@ -164,27 +145,32 @@ for (const model of [
 ]) IMAGE_SIZE_CONFIG[model] = IMAGE_SIZE_CONFIG[DEFAULT_IMAGE_MODEL];
 
 function isGrokImageModel(model) {
-  return /(^|\/)(?:grok-imagine-image(?:-2\.0|-quality)?|grok4\.(?:3|5)-img)$/i.test(String(model || "").trim());
+  return /(^|\/)(?:grok-[^/]+|grok4\.(?:3|5)-img)$/i.test(String(model || "").trim());
 }
 
 function configForModel(model) {
   model = String(model || '').split('/').pop().toLowerCase();
   if (isGrokImageModel(model)) return IMAGE_SIZE_CONFIG["grok-imagine-image"];
+  if (IMAGE_SIZE_CONFIG[model]) return IMAGE_SIZE_CONFIG[model];
+  if (model.startsWith('seedream-')) return SEEDREAM_IMAGE_SIZE_CONFIG;
+  if (model.startsWith('sensenova-')) return IMAGE_SIZE_CONFIG["sensenova-u1.5-lite"];
+  if (model.startsWith('gemini-')) return IMAGE_SIZE_CONFIG[DEFAULT_IMAGE_MODEL];
+  if (model.startsWith('gpt-')) return IMAGE_SIZE_CONFIG[DEFAULT_IMAGE_MODEL];
   return IMAGE_SIZE_CONFIG[model] || IMAGE_SIZE_CONFIG[DEFAULT_IMAGE_MODEL];
 }
 
 function normalizeCustomDimension(value, fallback, model) {
   const numeric = Math.round(Number(value));
   if (!Number.isFinite(numeric) || numeric <= 0) return fallback;
-  if (/sensenova-u1\.5-lite/i.test(String(model || ""))) return Math.max(512, Math.min(4096, Math.round(numeric / 32) * 32));
+  if (isSenseLiteModel(model)) return Math.max(512, Math.min(4096, Math.round(numeric / 32) * 32));
   return Math.min(16384, numeric);
 }
 
 function customImageSizeSelection(model, width, height) {
-  const fallback = /sensenova-u1\.5-lite/i.test(String(model || "")) ? 512 : 1024;
+  const fallback = isSenseLiteModel(model) ? 512 : 1024;
   let normalizedWidth = normalizeCustomDimension(width, fallback, model);
   let normalizedHeight = normalizeCustomDimension(height, fallback, model);
-  if (/sensenova-u1\.5-lite/i.test(String(model || ""))) {
+  if (isSenseLiteModel(model)) {
     if (normalizedWidth > normalizedHeight * 3) normalizedWidth = Math.max(512, Math.floor(normalizedHeight * 3 / 32) * 32);
     if (normalizedHeight > normalizedWidth * 3) normalizedHeight = Math.max(512, Math.floor(normalizedWidth * 3 / 32) * 32);
   }
@@ -241,13 +227,18 @@ function formatImageRatioOption(selection) {
 
 function modelKind(model) {
   const name = String(model || '').split('/').pop().toLowerCase();
-  if (/^gemini-(2\.5-flash|3-pro|3\.1-flash)-image(?:-preview)?$/.test(name)) return 'gemini';
-  if (/^seedream-(?:v5|5\.0)-(?:lite|pro)$/.test(name)) return 'seedream';
-  if (/^sensenova-u1\.5-lite$/.test(name)) return 'sense-lite';
-  if (/^sensenova-u1-fast$/.test(name)) return 'sense-fast';
+  if (name.startsWith('gemini-')) return 'gemini';
+  if (name.startsWith('seedream-')) return 'seedream';
+  if (name === 'sensenova-u1-fast') return 'sense-fast';
+  if (name.startsWith('sensenova-')) return 'sense-lite';
   if (name === 'grok-imagine-image-2.0') return 'grok-json';
   if (isGrokImageModel(model)) return 'grok';
+  if (name.startsWith('gpt-')) return 'generic';
   return 'generic';
+}
+function isSenseLiteModel(model) {
+  const name = String(model || '').split('/').pop().toLowerCase();
+  return name.startsWith('sensenova-') && name !== 'sensenova-u1-fast';
 }
 return { getImageSizeSelection, getImageSizeOptions, normalizeImageSizeSelection, modelKind };
 });

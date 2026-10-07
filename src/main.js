@@ -264,6 +264,9 @@ function providerBaseUrls(provider) {
 }
 function providerModels(provider) { return Array.isArray(provider.models) ? provider.models : []; }
 function normalizeProvider(provider) {
+  provider = { ...(provider || {}) };
+  delete provider.remainingPath;
+  if (provider.balance && typeof provider.balance === 'object') delete provider.balance.remaining;
   const balanceAdapter = provider.balanceAdapter === 'neko-api' ? 'sub2api' : (provider.balanceAdapter || 'none');
   const loginUrl = cleanBaseUrl(provider.loginUrl || provider.baseUrl || provider.requestUrl);
   const requestSource = Object.prototype.hasOwnProperty.call(provider, 'requestUrl') ? provider.requestUrl : provider.baseUrl;
@@ -290,13 +293,11 @@ function normalizeProvider(provider) {
     balanceUrl: provider.balanceUrl || '',
     balanceMethod: provider.balanceMethod || 'GET',
     balancePath: provider.balancePath || 'data.balance',
-    remainingPath: provider.remainingPath || '',
     ...currencySettings(provider),
     dailyStats: normalizeDailyStats(provider.dailyStats),
     accountStats: balanceAdapter !== 'none' && provider.accountStats && typeof provider.accountStats === 'object' ? { ...provider.accountStats } : null,
     balance: {
       balance: null,
-      remaining: null,
       status: 'unknown',
       apiStatus: 'unknown',
       error: '',
@@ -304,7 +305,7 @@ function normalizeProvider(provider) {
       configured: false,
       ...(provider.balance || {}),
       currency: currencySettings(provider).currency,
-      ...(balanceAdapter === 'none' ? { balance: null, remaining: null, status: 'disabled', apiStatus: 'disabled', error: '', updatedAt: '', configured: false } : {})
+      ...(balanceAdapter === 'none' ? { balance: null, status: 'disabled', apiStatus: 'disabled', error: '', updatedAt: '', configured: false } : {})
     }
   };
 }
@@ -426,7 +427,6 @@ async function queryProviderBalance(id) {
       provider.balance = {
         ...provider.balance,
         balance: result.balance,
-        remaining: result.remaining ?? null,
         currency: provider.currency,
         status: balanceStatus(result.balance, state.balanceSettings.lowThreshold),
         apiStatus: 'online',
@@ -708,7 +708,7 @@ async function detectAccountAdapter(provider, credentials) {
   }
   throw new Error(errors.join('；') || '无法识别站点账户接口');
 }
-ipcMain.handle('connect-provider-account', async (_e, input) => {
+async function connectProviderAccount(input, { keepWindowOpen = false } = {}) {
   const isDraft = Boolean(input && typeof input === 'object' && input.provider);
   const id = typeof input === 'string' ? input : String(input?.id || '');
   const provider = isDraft ? normalizeProvider(input.provider) : state.providers.find(item => item.id === id);
@@ -783,7 +783,6 @@ ipcMain.handle('connect-provider-account', async (_e, input) => {
         provider.balance = {
           ...(provider.balance || {}),
           balance: Number(accountData.balance),
-          remaining: accountData.remaining ?? null,
           currency: provider.currency,
           status: balanceStatus(accountData.balance, state.balanceSettings.lowThreshold),
           apiStatus: 'online',
@@ -796,7 +795,7 @@ ipcMain.handle('connect-provider-account', async (_e, input) => {
         if (!isDraft) persist();
         const snapshot = { accountToken: provider.accountToken, accountRefreshToken: provider.accountRefreshToken, accountCookie: provider.accountCookie, accountUserId: provider.accountUserId, accountSession: provider.accountSession, accountStats: provider.accountStats, balance: provider.balance, balanceAdapter: provider.balanceAdapter, ...currencySettings(provider) };
         await finish({ ok: true, state: safeState(), ...(isDraft ? { provider: snapshot } : {}) });
-        if (!loginWindow.isDestroyed()) loginWindow.close();
+        if (!keepWindowOpen && !loginWindow.isDestroyed()) loginWindow.close();
       } finally {
         capturing = false;
       }
@@ -806,7 +805,8 @@ ipcMain.handle('connect-provider-account', async (_e, input) => {
     loginWindow.on('closed', () => { clearInterval(poll); finish({ ok: false, error: lastCaptureError || '登录窗口已关闭，尚未获取到账户会话', state: safeState() }); });
     loginWindow.loadURL(loginUrl || `${origin}/login`);
   });
-});
+}
+ipcMain.handle('connect-provider-account', (_e, input) => connectProviderAccount(input));
 function makeWindow() {
   writeStartupLog('正在创建主窗口');
   mainWindow = new BrowserWindow({ width: CLOSED_WINDOW_SIZE.width, height: CLOSED_WINDOW_SIZE.height, minWidth: CLOSED_WINDOW_SIZE.width, minHeight: CLOSED_WINDOW_SIZE.height, center: true, transparent: true, frame: false, resizable: false, alwaysOnTop: true, show: true, webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: true, nodeIntegration: false } });
@@ -984,6 +984,7 @@ app.on('before-quit', () => { isQuitting = true; });
 app.on('will-quit', () => { tray?.destroy(); gateway?.close(); });
 
 ipcMain.handle('get-state', () => safeState());
+ipcMain.handle('open-provider-login', (_e, input) => connectProviderAccount(input, { keepWindowOpen: true }));
 ipcMain.handle('detect-provider-currency', async (_e, input = {}) => {
   let provider;
   try {
@@ -1163,7 +1164,7 @@ ipcMain.handle('save-provider', (_e, input) => {
   const tokenRemark = Object.prototype.hasOwnProperty.call(input, 'tokenRemark') ? String(input.tokenRemark || '').trim() : (existing?.tokenRemark || '');
   const apiKeys = Array.isArray(input.apiKeys) ? input.apiKeys : [{ key: String(input.apiKey || '').trim() || existing?.apiKey || '', remark: tokenRemark, enabled: true }];
   const selectedAdapter = input.balanceAdapter === 'neko-api' ? 'sub2api' : (input.balanceAdapter || 'none');
-  const record = normalizeProvider({ id: input.id || crypto.randomUUID(), name: String(input.name || '未命名 Provider').trim(), loginUrl: cleanBaseUrl(input.loginUrl) || existing?.loginUrl || existing?.baseUrl || '', requestUrl, apiKeys, apiKey: String(input.apiKey || '').trim() || existing?.apiKey || '', tokenRemark, accountToken: String(input.accountToken || '').trim() || existing?.accountToken || '', accountCookie: String(input.accountCookie || '').trim() || existing?.accountCookie || '', accountSession: String(input.accountSession || '').trim() || existing?.accountSession || '', accountUserId: String(input.accountUserId || '').trim() || existing?.accountUserId || '', accountStats: input.accountStats || (existing?.balanceAdapter === selectedAdapter ? existing?.accountStats || null : null), balance: input.balance || null, models: [], status: 'unknown', error: '', balanceAdapter: selectedAdapter, balanceUrl: input.balanceUrl, balanceMethod: input.balanceMethod, balancePath: input.balancePath, remainingPath: input.remainingPath, currency: input.currency, currencyMode: input.currencyMode || (existing ? currencySettings(existing).currencyMode : undefined), detectedCurrency: input.detectedCurrency ?? existing?.detectedCurrency, currencyDetection: input.currencyDetection ?? existing?.currencyDetection, dailyStats: existing?.dailyStats });
+  const record = normalizeProvider({ id: input.id || crypto.randomUUID(), name: String(input.name || '未命名 Provider').trim(), loginUrl: cleanBaseUrl(input.loginUrl) || existing?.loginUrl || existing?.baseUrl || '', requestUrl, apiKeys, apiKey: String(input.apiKey || '').trim() || existing?.apiKey || '', tokenRemark, accountToken: String(input.accountToken || '').trim() || existing?.accountToken || '', accountCookie: String(input.accountCookie || '').trim() || existing?.accountCookie || '', accountSession: String(input.accountSession || '').trim() || existing?.accountSession || '', accountUserId: String(input.accountUserId || '').trim() || existing?.accountUserId || '', accountStats: input.accountStats || (existing?.balanceAdapter === selectedAdapter ? existing?.accountStats || null : null), balance: input.balance || null, models: [], status: 'unknown', error: '', balanceAdapter: selectedAdapter, balanceUrl: input.balanceUrl, balanceMethod: input.balanceMethod, balancePath: input.balancePath, currency: input.currency, currencyMode: input.currencyMode || (existing ? currencySettings(existing).currencyMode : undefined), detectedCurrency: input.detectedCurrency ?? existing?.detectedCurrency, currencyDetection: input.currencyDetection ?? existing?.currencyDetection, dailyStats: existing?.dailyStats });
   record.accountRefreshToken = cleanSessionToken(input.accountRefreshToken || existing?.accountRefreshToken);
   const idx = state.providers.findIndex(p => p.id === record.id);
   if (idx >= 0) {

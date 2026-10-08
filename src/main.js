@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, clipboard, shell, screen, dialog, net } = require('electron');
+const { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, clipboard, shell, screen, dialog, net, session } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const http = require('http');
@@ -7,6 +7,20 @@ const balanceAdapters = require('./providers');
 const { currencySettings, rememberCurrency } = require('./provider-currency');
 const { requestImage, imageData } = require('./image-generation');
 const { detectMime } = require('./image-format');
+const { AccountSessions, originOf, credentialsOf } = require('./account-sessions');
+const { configureAccountSessions } = require('./account-session-context');
+const accountSessions = new AccountSessions({ session, BrowserWindow, ipcMain,
+  dataDirectory: () => app.getPath('userData'), readCredentials: readSub2apiCredentials,
+  onChanged: (provider, previousCredentials) => {
+    const saved = state.providers.find(item => item.id === provider.id && originOf(item) === originOf(provider));
+    if (!saved) return;
+    if (saved !== provider && (saved.balanceAdapter !== provider.balanceAdapter
+      || JSON.stringify(credentialsOf(saved)) !== previousCredentials)) return;
+    Object.assign(saved, credentialsOf(provider), { accountBrowserId: provider.accountBrowserId });
+    persist();
+  }
+});
+configureAccountSessions(accountSessions);
 
 const PORT = 8787;
 let mainWindow;
@@ -439,6 +453,11 @@ async function queryProviderBalance(id) {
           ...(result.accountStats.todayCost != null && Number.isFinite(Number(result.accountStats.todayCost)) ? { todayCost: Number(result.accountStats.todayCost) } : {}),
           ...(result.accountStats.todayRequests != null && Number.isFinite(Number(result.accountStats.todayRequests)) ? { todayRequests: Number(result.accountStats.todayRequests) } : {}),
           ...(result.accountStats.todayTokens != null && Number.isFinite(Number(result.accountStats.todayTokens)) ? { todayTokens: Number(result.accountStats.todayTokens) } : {}),
+          ...(result.accountStats.inputTokens != null && Number.isFinite(Number(result.accountStats.inputTokens)) ? { inputTokens: Number(result.accountStats.inputTokens) } : {}),
+          ...(result.accountStats.cacheTokens != null && Number.isFinite(Number(result.accountStats.cacheTokens)) ? { cacheTokens: Number(result.accountStats.cacheTokens) } : {}),
+          ...(result.accountStats.cacheHitRate24h != null && Number.isFinite(Number(result.accountStats.cacheHitRate24h)) ? { cacheHitRate24h: Number(result.accountStats.cacheHitRate24h) } : {}),
+          ...(result.accountStats.cacheHitRateRecent20 != null && Number.isFinite(Number(result.accountStats.cacheHitRateRecent20)) ? { cacheHitRateRecent20: Number(result.accountStats.cacheHitRateRecent20) } : {}),
+          ...(result.accountStats.cacheHitRate != null && Number.isFinite(Number(result.accountStats.cacheHitRate)) ? { cacheHitRate: Number(result.accountStats.cacheHitRate) } : {}),
           ...(result.accountStats.averageDurationMs != null && Number.isFinite(Number(result.accountStats.averageDurationMs)) ? { averageDurationMs: Number(result.accountStats.averageDurationMs) } : {}),
           updatedAt: now
         };
@@ -562,7 +581,7 @@ function tokenFromValue(value, keyHint = '', seen = new Set()) {
   }
   return '';
 }
-async function readSub2apiCredentials(loginWindow, origin) {
+async function readSub2apiCredentials(loginWindow, origin, { refresh = true } = {}) {
   const cookieByKey = new Map();
   const collectCookies = async (url) => {
     try {
@@ -575,6 +594,7 @@ async function readSub2apiCredentials(loginWindow, origin) {
   };
   await collectCookies(origin);
   await collectCookies(`${origin}/api/user/auth/refresh`);
+  await collectCookies(`${origin}/api/v1/auth/refresh`);
   if (!cookieByKey.size) {
     try {
       const hostname = new URL(origin).hostname;
@@ -602,6 +622,7 @@ async function readSub2apiCredentials(loginWindow, origin) {
   }
   try {
     const storageEntries = await loginWindow.webContents.executeJavaScript(`(() => {
+      if (location.origin !== ${JSON.stringify(origin)}) return [];
       const entries = [];
       for (const storage of [localStorage, sessionStorage]) {
         for (let i = 0; i < storage.length; i += 1) {
@@ -624,10 +645,23 @@ async function readSub2apiCredentials(loginWindow, origin) {
       }
     }
   } catch {}
+  try {
+    const auth = await loginWindow.webContents.executeJavaScript(`location.origin === ${JSON.stringify(origin)} ? window.__apiPetAuth || null : null`, true);
+    if (auth && !Array.isArray(auth)) {
+      // Sub2API stores rotating credentials in localStorage. An earlier observed
+      // response must not replace a newer browser login or token rotation.
+      if (!accountRefreshToken) {
+        accountToken = cleanSessionToken(auth.access_token || auth.accessToken) || accountToken;
+        accountRefreshToken = cleanSessionToken(auth.refresh_token || auth.refreshToken);
+      }
+      accountSession = sessionIdFromValue(auth);
+      accountUserId = accountUserIdFromValue(auth.user, 'user') || accountUserId;
+    }
+  } catch {}
   // New API keeps the access token in an in-memory auth store and the session
   // cookie is usually HttpOnly. Refresh once from the login page itself so the
   // request has the exact same credentials as the site's own frontend.
-  if (cookies.some(cookie => cookie.name === 'new_api_refresh')) {
+  if (refresh && cookies.some(cookie => cookie.name === 'new_api_refresh')) {
     try {
       const pageRefresh = await loginWindow.webContents.executeJavaScript(`(async () => {
         if (location.origin !== ${JSON.stringify(origin)}) return null;
@@ -648,7 +682,7 @@ async function readSub2apiCredentials(loginWindow, origin) {
         }
         };
         return navigator.locks
-          ? navigator.locks.request('new-api:auth-refresh', refresh)
+          ? navigator.locks.request('new-api:auth-refresh', { signal: AbortSignal.timeout(10000) }, refresh)
           : refresh();
       })()`, true);
       if (pageRefresh?.ok && pageRefresh.body?.success !== false) {
@@ -718,84 +752,101 @@ async function connectProviderAccount(input, { keepWindowOpen = false } = {}) {
   const loginUrl = cleanBaseUrl(typeof input === 'object' ? input?.loginUrl : '') || provider.loginUrl;
   const origin = sub2apiOrigin({ ...provider, loginUrl });
   if (!origin) return { ok: false, error: '登录地址无效', state: safeState() };
+  provider.loginUrl = loginUrl;
+  const browserSession = await accountSessions.prepare(provider);
   return new Promise(resolve => {
     let settled = false;
     let capturing = false;
     let lastCaptureError = '';
     const attemptedCredentials = new Set();
-    const loginWindow = new BrowserWindow({ parent: mainWindow, modal: false, width: 1100, height: 760, title: `连接 ${provider.name} 账户`, webPreferences: { contextIsolation: true, nodeIntegration: false } });
+    const loginWindow = new BrowserWindow({ parent: mainWindow, modal: false, width: 1100, height: 760, title: `连接 ${provider.name} 账户`, webPreferences: { partition: browserSession.partition, preload: path.join(__dirname, 'account-preload.js'), contextIsolation: true, nodeIntegration: false } });
+    accountSessions.attach(provider, loginWindow);
     const finish = async (result) => { if (settled) return; settled = true; resolve(result); };
     const tryCapture = async () => {
-      if (settled || capturing || loginWindow.isDestroyed()) return;
+      if ((settled && !keepWindowOpen) || capturing || loginWindow.isDestroyed()) return;
       capturing = true;
       try {
-        const credentials = await readSub2apiCredentials(loginWindow, origin);
-        if (settled || loginWindow.isDestroyed()) return;
-        const capturedUserId = credentials.accountUserId || provider.accountUserId || '';
-        if (!credentials.accountToken && !credentials.accountRefreshToken && !credentials.accountCookie && !capturedUserId) return;
-        const credentialFingerprint = `${credentials.accountToken}\n${credentials.accountRefreshToken}\n${credentials.accountCookie}\n${credentials.accountSession}\n${capturedUserId}`;
-        if (attemptedCredentials.has(credentialFingerprint)) return;
-        attemptedCredentials.add(credentialFingerprint);
-        const accountProvider = { ...provider, loginUrl, ...credentials, accountUserId: capturedUserId };
-        let accountData;
-        let resolvedAdapter = adapter;
-        try {
-          const detected = await detectAccountAdapter(accountProvider, { ...credentials, accountUserId: capturedUserId });
-          resolvedAdapter = detected.adapter;
-          accountData = detected.accountData;
-          Object.assign(accountProvider, detected.credentials);
-        } catch (error) {
-          lastCaptureError = String(error?.message || error || '账户接口验证失败');
-          if (!loginWindow.isDestroyed()) loginWindow.setTitle(`连接 ${provider.name} 账户 - ${lastCaptureError.slice(0, 80)}`);
+        if (settled) {
+          await accountSessions.run(provider, async () => {});
           return;
         }
-        if (settled || loginWindow.isDestroyed()) return;
-        if (resolvedAdapter.id === 'sub2api' && accountProvider.accountRefreshToken
-          && accountProvider.accountRefreshToken !== credentials.accountRefreshToken) {
+        const connected = await accountSessions.run(provider, async () => {
+          const credentials = await readSub2apiCredentials(loginWindow, origin);
+          if (settled || loginWindow.isDestroyed()) return;
+          const capturedUserId = credentials.accountUserId || provider.accountUserId || '';
+          if (!credentials.accountToken && !credentials.accountRefreshToken && !credentials.accountCookie && !capturedUserId) return;
+          const credentialFingerprint = `${credentials.accountToken}\n${credentials.accountRefreshToken}\n${credentials.accountCookie}\n${credentials.accountSession}\n${capturedUserId}`;
+          if (attemptedCredentials.has(credentialFingerprint)) return;
+          attemptedCredentials.add(credentialFingerprint);
+          const accountProvider = { ...provider, loginUrl, ...credentials, accountUserId: capturedUserId };
+          let accountData;
+          let resolvedAdapter = adapter;
           try {
-            const storageCredentials = { origin, token: accountProvider.accountToken, refreshToken: accountProvider.accountRefreshToken };
-            await loginWindow.webContents.executeJavaScript(`(() => {
-              const credentials = ${JSON.stringify(storageCredentials)};
-              if (location.origin !== credentials.origin) return;
-              localStorage.setItem('auth_token', credentials.token);
-              localStorage.setItem('refresh_token', credentials.refreshToken);
-            })()`, true);
-          } catch {}
+            const detected = await detectAccountAdapter(accountProvider, { ...credentials, accountUserId: capturedUserId });
+            resolvedAdapter = detected.adapter;
+            accountData = detected.accountData;
+            Object.assign(accountProvider, detected.credentials);
+          } catch (error) {
+            lastCaptureError = String(error?.message || error || '账户接口验证失败');
+            if (!loginWindow.isDestroyed()) loginWindow.setTitle(`连接 ${provider.name} 账户 - ${lastCaptureError.slice(0, 80)}`);
+            return;
+          }
+          if (settled || loginWindow.isDestroyed()) return;
+          if (resolvedAdapter.id === 'sub2api' && accountProvider.accountRefreshToken
+            && accountProvider.accountRefreshToken !== credentials.accountRefreshToken) {
+            try {
+              const storageCredentials = { origin, token: accountProvider.accountToken, refreshToken: accountProvider.accountRefreshToken };
+              await loginWindow.webContents.executeJavaScript(`(() => {
+                const credentials = ${JSON.stringify(storageCredentials)};
+                if (location.origin !== credentials.origin) return;
+                localStorage.setItem('auth_token', credentials.token);
+                localStorage.setItem('refresh_token', credentials.refreshToken);
+              })()`, true);
+            } catch {}
+          }
+          provider.balanceAdapter = resolvedAdapter.id;
+          rememberCurrency(provider, accountData);
+          // New API access tokens are short-lived. The adapter may refresh one from
+          // the captured session cookie while validating the account, so prefer the
+          // refreshed value from accountProvider over the stale captured value.
+          provider.accountToken = accountProvider.accountToken || credentials.accountToken || provider.accountToken || '';
+          provider.accountRefreshToken = accountProvider.accountRefreshToken || '';
+          provider.accountCookie = accountProvider.accountCookie || '';
+          provider.accountUserId = accountProvider.accountUserId || '';
+          provider.accountSession = accountProvider.accountSession || '';
+          const now = new Date().toISOString();
+          provider.accountStats = accountData.accountStats ? {
+            ...(accountData.accountStats.todayCost != null && Number.isFinite(Number(accountData.accountStats.todayCost)) ? { todayCost: Number(accountData.accountStats.todayCost) } : {}),
+            ...(accountData.accountStats.todayRequests != null && Number.isFinite(Number(accountData.accountStats.todayRequests)) ? { todayRequests: Number(accountData.accountStats.todayRequests) } : {}),
+            ...(accountData.accountStats.todayTokens != null && Number.isFinite(Number(accountData.accountStats.todayTokens)) ? { todayTokens: Number(accountData.accountStats.todayTokens) } : {}),
+            ...(accountData.accountStats.inputTokens != null && Number.isFinite(Number(accountData.accountStats.inputTokens)) ? { inputTokens: Number(accountData.accountStats.inputTokens) } : {}),
+            ...(accountData.accountStats.cacheTokens != null && Number.isFinite(Number(accountData.accountStats.cacheTokens)) ? { cacheTokens: Number(accountData.accountStats.cacheTokens) } : {}),
+            ...(accountData.accountStats.cacheHitRate24h != null && Number.isFinite(Number(accountData.accountStats.cacheHitRate24h)) ? { cacheHitRate24h: Number(accountData.accountStats.cacheHitRate24h) } : {}),
+            ...(accountData.accountStats.cacheHitRateRecent20 != null && Number.isFinite(Number(accountData.accountStats.cacheHitRateRecent20)) ? { cacheHitRateRecent20: Number(accountData.accountStats.cacheHitRateRecent20) } : {}),
+            ...(accountData.accountStats.cacheHitRate != null && Number.isFinite(Number(accountData.accountStats.cacheHitRate)) ? { cacheHitRate: Number(accountData.accountStats.cacheHitRate) } : {}),
+            ...(accountData.accountStats.averageDurationMs != null && Number.isFinite(Number(accountData.accountStats.averageDurationMs)) ? { averageDurationMs: Number(accountData.accountStats.averageDurationMs) } : {}),
+            updatedAt: now
+          } : provider.accountStats || null;
+          provider.balance = {
+            ...(provider.balance || {}),
+            balance: Number(accountData.balance),
+            currency: provider.currency,
+            status: balanceStatus(accountData.balance, state.balanceSettings.lowThreshold),
+            apiStatus: 'online',
+            error: '',
+            updatedAt: now,
+            configured: true
+          };
+          provider.balanceStatus = provider.balance.status;
+          provider.balanceError = '';
+          if (!isDraft) persist();
+          return true;
+        });
+        if (connected) {
+          const snapshot = { accountBrowserId: provider.accountBrowserId, accountToken: provider.accountToken, accountRefreshToken: provider.accountRefreshToken, accountCookie: provider.accountCookie, accountUserId: provider.accountUserId, accountSession: provider.accountSession, accountStats: provider.accountStats, balance: provider.balance, balanceAdapter: provider.balanceAdapter, ...currencySettings(provider) };
+          await finish({ ok: true, state: safeState(), ...(isDraft ? { provider: snapshot } : {}) });
         }
-        provider.balanceAdapter = resolvedAdapter.id;
-        rememberCurrency(provider, accountData);
-        // New API access tokens are short-lived. The adapter may refresh one from
-        // the captured session cookie while validating the account, so prefer the
-        // refreshed value from accountProvider over the stale captured value.
-        provider.accountToken = accountProvider.accountToken || credentials.accountToken || provider.accountToken || '';
-        provider.accountRefreshToken = accountProvider.accountRefreshToken || '';
-        provider.accountCookie = accountProvider.accountCookie || '';
-        provider.accountUserId = accountProvider.accountUserId || '';
-        provider.accountSession = accountProvider.accountSession || '';
-        const now = new Date().toISOString();
-        provider.accountStats = accountData.accountStats ? {
-          ...(accountData.accountStats.todayCost != null && Number.isFinite(Number(accountData.accountStats.todayCost)) ? { todayCost: Number(accountData.accountStats.todayCost) } : {}),
-          ...(accountData.accountStats.todayRequests != null && Number.isFinite(Number(accountData.accountStats.todayRequests)) ? { todayRequests: Number(accountData.accountStats.todayRequests) } : {}),
-          ...(accountData.accountStats.todayTokens != null && Number.isFinite(Number(accountData.accountStats.todayTokens)) ? { todayTokens: Number(accountData.accountStats.todayTokens) } : {}),
-          ...(accountData.accountStats.averageDurationMs != null && Number.isFinite(Number(accountData.accountStats.averageDurationMs)) ? { averageDurationMs: Number(accountData.accountStats.averageDurationMs) } : {}),
-          updatedAt: now
-        } : provider.accountStats || null;
-        provider.balance = {
-          ...(provider.balance || {}),
-          balance: Number(accountData.balance),
-          currency: provider.currency,
-          status: balanceStatus(accountData.balance, state.balanceSettings.lowThreshold),
-          apiStatus: 'online',
-          error: '',
-          updatedAt: now,
-          configured: true
-        };
-        provider.balanceStatus = provider.balance.status;
-        provider.balanceError = '';
-        if (!isDraft) persist();
-        const snapshot = { accountToken: provider.accountToken, accountRefreshToken: provider.accountRefreshToken, accountCookie: provider.accountCookie, accountUserId: provider.accountUserId, accountSession: provider.accountSession, accountStats: provider.accountStats, balance: provider.balance, balanceAdapter: provider.balanceAdapter, ...currencySettings(provider) };
-        await finish({ ok: true, state: safeState(), ...(isDraft ? { provider: snapshot } : {}) });
-        if (!keepWindowOpen && !loginWindow.isDestroyed()) loginWindow.close();
+        if (settled && !keepWindowOpen && !loginWindow.isDestroyed()) loginWindow.close();
       } finally {
         capturing = false;
       }
@@ -803,7 +854,9 @@ async function connectProviderAccount(input, { keepWindowOpen = false } = {}) {
     const poll = setInterval(() => tryCapture().catch(() => {}), 1200);
     loginWindow.webContents.on('did-finish-load', () => setTimeout(() => tryCapture().catch(() => {}), 700));
     loginWindow.on('closed', () => { clearInterval(poll); finish({ ok: false, error: lastCaptureError || '登录窗口已关闭，尚未获取到账户会话', state: safeState() }); });
-    loginWindow.loadURL(loginUrl || `${origin}/login`);
+    loginWindow.loadURL(loginUrl || `${origin}/login`).catch(error => {
+      lastCaptureError = `登录页面加载失败：${error.message}`;
+    });
   });
 }
 ipcMain.handle('connect-provider-account', (_e, input) => connectProviderAccount(input));
@@ -877,14 +930,18 @@ async function directChatRequest(input = {}) {
       upstreamUrl = `${base}/${format}`;
       upstream = await fetch(upstreamUrl, { method: 'POST', headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json', Accept: 'application/json, text/event-stream' }, body: JSON.stringify(upstreamBody) });
       const contentType = upstream.headers.get('content-type') || '';
-      if (upstream.ok && !contentType.toLowerCase().includes('text/html')) break;
+      if (upstream.ok && !contentType.toLowerCase().includes('text/html')) {
+        lastError = null;
+        break;
+      }
       const text = await upstream.text();
       let errorBody; try { errorBody = JSON.parse(text); } catch { errorBody = {}; }
       lastError = new Error(`${upstream.status} ${upstream.statusText}: ${errorBody?.error?.message || text.slice(0, 200)}`);
       if (upstream.status === 404 || upstream.status === 405 || (upstream.ok && contentType.toLowerCase().includes('text/html'))) continue;
       break;
     }
-    if (!upstream) throw lastError || new Error(`无法连接上游 Provider：${upstreamUrl || provider.name}`);
+    if (lastError) throw lastError;
+    if (!upstream) throw new Error(`无法连接上游 Provider：${upstreamUrl || provider.name}`);
     const responseText = await upstream.text();
     let payload; try { payload = JSON.parse(responseText); } catch { payload = { output_text: responseText }; }
     if (!upstream.ok) throw new Error(payload?.error?.message || `${upstream.status} ${upstream.statusText}`);
@@ -1166,6 +1223,8 @@ ipcMain.handle('save-provider', (_e, input) => {
   const selectedAdapter = input.balanceAdapter === 'neko-api' ? 'sub2api' : (input.balanceAdapter || 'none');
   const record = normalizeProvider({ id: input.id || crypto.randomUUID(), name: String(input.name || '未命名 Provider').trim(), loginUrl: cleanBaseUrl(input.loginUrl) || existing?.loginUrl || existing?.baseUrl || '', requestUrl, apiKeys, apiKey: String(input.apiKey || '').trim() || existing?.apiKey || '', tokenRemark, accountToken: String(input.accountToken || '').trim() || existing?.accountToken || '', accountCookie: String(input.accountCookie || '').trim() || existing?.accountCookie || '', accountSession: String(input.accountSession || '').trim() || existing?.accountSession || '', accountUserId: String(input.accountUserId || '').trim() || existing?.accountUserId || '', accountStats: input.accountStats || (existing?.balanceAdapter === selectedAdapter ? existing?.accountStats || null : null), balance: input.balance || null, models: [], status: 'unknown', error: '', balanceAdapter: selectedAdapter, balanceUrl: input.balanceUrl, balanceMethod: input.balanceMethod, balancePath: input.balancePath, currency: input.currency, currencyMode: input.currencyMode || (existing ? currencySettings(existing).currencyMode : undefined), detectedCurrency: input.detectedCurrency ?? existing?.detectedCurrency, currencyDetection: input.currencyDetection ?? existing?.currencyDetection, dailyStats: existing?.dailyStats });
   record.accountRefreshToken = cleanSessionToken(input.accountRefreshToken || existing?.accountRefreshToken);
+  record.accountBrowserId = input.accountBrowserId || existing?.accountBrowserId || record.id;
+  accountSessions.restore(record);
   const idx = state.providers.findIndex(p => p.id === record.id);
   if (idx >= 0) {
     record.models = state.providers[idx].models || [];

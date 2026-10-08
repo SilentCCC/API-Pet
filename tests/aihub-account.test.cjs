@@ -26,7 +26,7 @@ function missingAdapter(id) {
   return { id, label: id, detect: async () => { throw Object.assign(new Error('404 page not found'), { status: 404 }); } };
 }
 function loadMain(adapters) {
-  const context = vm.createContext({ URL, balanceAdapters: adapters, ...require('../src/provider-currency') });
+  const context = vm.createContext({ URL, path, __dirname: path.join(__dirname, '../src'), balanceAdapters: adapters, ...require('../src/provider-currency') });
   vm.runInContext(source.slice(source.indexOf('function isJwt('), source.indexOf("ipcMain.handle('connect-provider-account'")), context);
   return context;
 }
@@ -175,11 +175,12 @@ test('connecting saves the detected adapter and allows balance refresh and impor
       this.webContents.executeJavaScript = async () => [{ key: 'aihub_token', value: record().accountToken }];
     }
     isDestroyed() { return this.destroyed || false; }
-    loadURL() { setImmediate(() => this.webContents.emit('did-finish-load')); }
+    async loadURL() { setImmediate(() => this.webContents.emit('did-finish-load')); }
     setTitle() {}
     close() { this.destroyed = true; closed += 1; this.emit('closed'); }
   }
   Object.assign(context, {
+    accountSessions: { prepare: async () => ({ partition: 'persist:test-account' }), attach() {}, run: (_provider, callback) => callback() },
     ipcMain: { handle: (name, fn) => { handlers[name] = fn; } }, BrowserWindow: LoginWindow,
     mainWindow: null, state: { providers: [record()], balanceSettings: { lowThreshold: 0.1 } },
     normalizeProvider: value => ({ ...value }), cleanBaseUrl: value => String(value || ''),

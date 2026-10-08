@@ -11,6 +11,7 @@ function loadNetwork(electron, netFetch, nodeFetch) {
     process: { versions: electron ? { electron: '31' } : {} },
     require: name => {
       if (name === '../provider-currency') return require('../src/provider-currency');
+      if (name === '../account-session-context') return require('../src/account-session-context');
       assert.equal(name, 'electron');
       return { net: { fetch: netFetch } };
     },
@@ -102,4 +103,38 @@ test('New API user logs provide today usage when performance stats are admin-onl
   assert.equal(result.accountStats.todayTokens, 11874);
   assert.equal(result.accountStats.todayCost, 0.22875);
   assert.equal(result.accountStats.averageDurationMs, 19000);
+});
+
+test('New API overlapping balance queries and key imports share refresh cookie rotation', async () => {
+  const source = fs.readFileSync(path.join(__dirname, '../src/providers/new-api.js'), 'utf8');
+  let refreshCount = 0;
+  const context = vm.createContext({
+    module: { exports: {} }, URL, URLSearchParams, AbortController, setTimeout, clearTimeout,
+    require: () => ({ ...require('../src/providers/base'), accountFetch: async (url, options) => {
+      const pathname = new URL(url).pathname;
+      if (pathname === '/api/user/auth/refresh') {
+        refreshCount += 1;
+        assert.equal(options.headers.Cookie, 'new_api_refresh=old-cookie');
+        await new Promise(setImmediate);
+        return new Response(JSON.stringify({ success: true, data: { access_token: 'fresh-account-access-token' } }), {
+          headers: { 'Set-Cookie': 'new_api_refresh=rotated-cookie; Path=/; HttpOnly' }
+        });
+      }
+      if (options.headers.Authorization !== 'Bearer fresh-account-access-token') {
+        await new Promise(setImmediate);
+        return new Response('{"message":"expired"}', { status: 401 });
+      }
+      assert.equal(options.headers.Cookie, 'new_api_refresh=rotated-cookie');
+      const data = pathname === '/api/user/self' ? { quota: 500000 }
+        : pathname === '/api/token/' ? { items: [{ name: 'test', key: 'sk-test' }] } : {};
+      return new Response(JSON.stringify({ success: true, data }));
+    } })
+  });
+  vm.runInContext(source, context);
+  const record = { id: 'site', loginUrl: 'https://account.test', accountToken: 'expired-account-access-token', accountCookie: 'new_api_refresh=old-cookie' };
+  const [balance, keys] = await Promise.all([context.module.exports.getBalance(record), context.module.exports.getApiKeys(record)]);
+  assert.equal(balance.balance, 1);
+  assert.equal(keys.length, 1);
+  assert.equal(record.accountCookie, 'new_api_refresh=rotated-cookie');
+  assert.equal(refreshCount, 1);
 });

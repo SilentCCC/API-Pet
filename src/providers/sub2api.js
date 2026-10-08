@@ -7,6 +7,37 @@ function parseNumber(value) {
   return Number.isFinite(number) ? number : null;
 }
 
+function firstNumber(source, keys) {
+  for (const key of keys) {
+    const value = parseNumber(source?.[key]);
+    if (value != null) return value;
+  }
+  return null;
+}
+
+function usageItems(value) {
+  if (Array.isArray(value)) return value;
+  if (Array.isArray(value?.items)) return value.items;
+  if (Array.isArray(value?.records)) return value.records;
+  if (Array.isArray(value?.data)) return value.data;
+  return [];
+}
+
+function recentCacheHitRate(value) {
+  const rates = usageItems(value).slice(0, 20).map(item => {
+    const input = firstNumber(item, ['input_tokens', 'inputTokens', 'prompt_tokens', 'promptTokens']);
+    const cached = firstNumber(item, ['cache_read_tokens', 'cacheReadTokens', 'cached_tokens', 'cachedTokens', 'cache_tokens', 'cacheTokens']);
+    const denominator = input != null && cached != null ? input + cached : 0;
+    return denominator > 0 ? cached / denominator : null;
+  }).filter(rate => rate != null && Number.isFinite(rate));
+  return rates.length ? rates.reduce((sum, rate) => sum + rate, 0) / rates.length : null;
+}
+
+function cacheHitRate(input, cached) {
+  const denominator = input != null && cached != null ? input + cached : 0;
+  return denominator > 0 ? cached / denominator : null;
+}
+
 function apiUrl(provider, pathname) {
   try {
     const raw = String(provider.loginUrl || provider.requestUrl || provider.baseUrl || '').trim();
@@ -182,28 +213,53 @@ module.exports = {
     if (!token && !cookie && !refreshToken) return notConfigured('Sub2API', '点击“连接账户”完成网页授权');
     const profileUrl = apiUrl(provider, 'user/profile');
     const statsUrl = apiUrl(provider, 'usage/dashboard/stats');
+    const usageUrl = apiUrl(provider, 'usage');
     if (!profileUrl) throw new Error('Sub2API 登录地址无效');
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), 15000);
     try {
       const context = requestContext(provider);
-      const [profile, stats] = await Promise.all([
+      const [profile, stats, usage] = await Promise.all([
         provider._accountProfile || getProfile(provider, context, controller.signal),
         // Statistics are supplementary; a missing dashboard must not hide balance.
-        getJson(statsUrl, context, controller.signal).catch(() => null)
+        getJson(statsUrl, context, controller.signal).catch(() => null),
+        // The dashboard rate is an aggregate. The displayed rate is the arithmetic
+        // mean of per-record rates from the most recent twenty usage records.
+        (async () => {
+          try {
+            const url = new URL(usageUrl);
+            url.searchParams.set('page', '1');
+            url.searchParams.set('page_size', '20');
+            url.searchParams.set('sort_by', 'created_at');
+            url.searchParams.set('sort_order', 'desc');
+            return await getJson(url, context, controller.signal);
+          } catch {
+            return null;
+          }
+        })()
       ]);
       const user = profile?.user ?? profile;
       const balance = parseNumber(user?.balance);
       if (balance == null) throw new Error('Sub2API /user/profile 响应中没有可识别的 balance 字段');
       const todayCost = parseNumber(stats?.today_actual_cost);
       const todayRequests = parseNumber(stats?.today_requests);
+      const inputTokens = firstNumber(stats, ['today_input_tokens', 'todayInputTokens', 'input_tokens', 'inputTokens', 'prompt_tokens', 'promptTokens']);
+      const cacheTokens = firstNumber(stats, ['today_cache_read_tokens', 'todayCacheReadTokens', 'cache_read_tokens', 'cacheReadTokens', 'today_cached_tokens', 'todayCachedTokens', 'cached_tokens', 'cachedTokens', 'cache_tokens', 'cacheTokens']);
+      const cacheHitRate24h = cacheHitRate(inputTokens, cacheTokens);
+      const cacheHitRateRecent20 = recentCacheHitRate(usage);
       return {
         balance,
         ...balanceCurrency(provider, [user, profile, stats]),
-        ...(stats ? { accountStats: {
+        ...(stats || usage ? { accountStats: {
           todayCost,
           todayRequests,
           todayTokens: parseNumber(stats?.today_tokens),
+          inputTokens,
+          cacheTokens,
+          cacheHitRate24h,
+          cacheHitRateRecent20,
+          // Keep the old field for saved configurations and older renderers.
+          cacheHitRate: cacheHitRateRecent20,
           averageDurationMs: parseNumber(stats?.average_duration_ms)
         } } : {})
       };

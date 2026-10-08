@@ -145,14 +145,57 @@ test('account profile falls back to auth/me and retains the returned balance and
     assert.equal(options.headers['X-User-UI-Request'], '1');
     if (pathname.endsWith('/user/profile')) return json({ message: 'Not Found' }, 404);
     if (pathname.endsWith('/auth/me')) return json({ code: 0, data: { id: 123, balance: '0.1234' } });
-    return json({ code: 0, data: { today_actual_cost: '0.0001', today_requests: 2 } });
+    if (pathname === '/api/v1/usage') return json({ code: 0, data: { items: [
+      { input_tokens: 197, cache_read_tokens: 3328 },
+      { input_tokens: 100, cache_read_tokens: 100 }
+    ] } });
+    return json({ code: 0, data: { today_actual_cost: '0.0001', today_requests: 2, today_input_tokens: 197, today_cache_read_tokens: 3328 } });
   });
   const detection = await adapter.detect(record);
   const result = await adapter.getBalance({ ...record, _accountProfile: detection.profile });
   assert.equal(result.balance, 0.1234);
   assert.equal(result.accountStats.todayCost, 0.0001);
   assert.equal(result.accountStats.todayRequests, 2);
-  assert.deepEqual(calls, ['/api/v1/user/profile', '/api/v1/auth/me', '/api/v1/usage/dashboard/stats']);
+  assert.equal(result.accountStats.inputTokens, 197);
+  assert.equal(result.accountStats.cacheTokens, 3328);
+  assert.equal(result.accountStats.cacheHitRate24h, 3328 / (197 + 3328));
+  assert.equal(result.accountStats.cacheHitRateRecent20, ((3328 / (197 + 3328)) + (100 / (100 + 100))) / 2);
+  assert.equal(result.accountStats.cacheHitRate, ((3328 / (197 + 3328)) + (100 / (100 + 100))) / 2);
+  assert.deepEqual(calls, ['/api/v1/user/profile', '/api/v1/auth/me', '/api/v1/usage/dashboard/stats', '/api/v1/usage']);
+});
+
+test('cache hit rate averages valid recent records and skips invalid records', async () => {
+  const adapter = loadAdapter(async url => {
+    const pathname = new URL(url).pathname;
+    if (pathname.endsWith('/user/profile')) return json({ code: 0, data: { balance: 1 } });
+    if (pathname.endsWith('/usage')) return json({ code: 0, data: { items: [
+      { input_tokens: 197, cache_read_tokens: 3328 },
+      { input_tokens: 100, cache_read_tokens: 100 },
+      { input_tokens: 0, cache_read_tokens: 0 },
+      { input_tokens: 10 },
+      { cache_read_tokens: 10 }
+    ] } });
+    return json({ code: 0, data: {} });
+  });
+  const result = await adapter.getBalance(provider());
+  assert.equal(result.accountStats.cacheHitRate, ((3328 / (197 + 3328)) + 0.5) / 2);
+});
+
+test('cache hit rate is unavailable when no recent record has both token counters', async () => {
+  for (const items of [
+    [{ input_tokens: 197 }],
+    [{ cache_read_tokens: 3328 }],
+    [{ input_tokens: 0, cache_read_tokens: 0 }]
+  ]) {
+    const adapter = loadAdapter(async url => {
+      const pathname = new URL(url).pathname;
+      if (pathname.endsWith('/user/profile')) return json({ code: 0, data: { balance: 1 } });
+      if (pathname.endsWith('/usage')) return json({ code: 0, data: { items } });
+      return json({ code: 0, data: {} });
+    });
+    const result = await adapter.getBalance(provider());
+    assert.equal(result.accountStats.cacheHitRate, null);
+  }
 });
 
 test('auth/me supplies balance when user/profile contains no balance field', async () => {
@@ -186,7 +229,7 @@ test('account authentication failures are not hidden by fallback endpoints', asy
     return json({ message: 'Expired' }, 401);
   });
   await assert.rejects(adapter.getBalance(record), error => error.status === 401 && /重新连接账户/.test(error.message));
-  assert.equal(calls, 2); // Profile and supplementary statistics each run once.
+  assert.equal(calls, 3); // Profile, dashboard statistics, and recent usage each run once.
 });
 
 test('capture separates refresh_token from the Bearer token and prefers auth_token', async () => {

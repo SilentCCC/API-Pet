@@ -1,6 +1,7 @@
 const { notConfigured, accountFetch, balanceCurrency, withCurrencyHeader } = require('./base');
 
 const QUOTA_PER_DOLLAR = 500000;
+const pendingRefreshes = new WeakMap();
 
 function parseNumber(value) {
   if (value == null || String(value).trim() === '') return null;
@@ -171,7 +172,10 @@ async function getJson(url, headers, signal, method = 'GET', onUnauthorized) {
   try { body = JSON.parse(text); } catch { body = null; }
   const payload = unwrap(body);
   if (!response.ok || body?.success === false || (body?.code != null && body.code !== 0)) {
-    const error = new Error(`${response.status} ${response.statusText}: ${body?.message || body?.error?.message || text.slice(0, 240)}`);
+    const detail = body?.message || body?.error?.message || text.slice(0, 240);
+    const error = new Error(response.status === 401
+      ? `New API 登录凭据已过期，请重新连接账户: ${detail}`
+      : `${response.status} ${response.statusText}: ${detail}`);
     error.status = response.status;
     error.rateLimited = response.status === 429;
     throw error;
@@ -181,13 +185,23 @@ async function getJson(url, headers, signal, method = 'GET', onUnauthorized) {
 
 function authContext(provider, origin, signal) {
   const context = requestHeaders(provider);
-  let refreshPromise = null;
   const refresh = async () => {
     if (!context.cookie) return false;
-    if (!refreshPromise) {
-      refreshPromise = refreshAccessToken(provider, origin, context, signal).finally(() => { refreshPromise = null; });
+    let refreshed = true;
+    if (requestHeaders(provider).token === context.token) {
+      if (!pendingRefreshes.has(provider)) {
+        const pending = refreshAccessToken(provider, origin, context, signal).finally(() => { pendingRefreshes.delete(provider); });
+        pendingRefreshes.set(provider, pending);
+      }
+      refreshed = await pendingRefreshes.get(provider);
     }
-    return refreshPromise;
+    const latest = requestHeaders(provider);
+    for (const key of Object.keys(context.headers)) delete context.headers[key];
+    Object.assign(context.headers, latest.headers);
+    context.token = latest.token;
+    context.cookie = latest.cookie;
+    context.session = latest.session;
+    return refreshed;
   };
   return { ...context, refresh };
 }

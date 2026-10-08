@@ -12,6 +12,8 @@ function notConfigured(name, details) {
 
 function accountFetch(url, options = {}) {
   if (process.versions.electron) {
+    const context = require('../account-session-context').accountContext.getStore();
+    if (context) return context.fetch(url, options);
     // Use Chromium's system proxy settings, as the account login window does.
     // Only send this provider's explicit cookies, never the shared cookie jar.
     return require('electron').net.fetch(url, { ...options, credentials: 'omit', bypassCustomProtocolHandlers: true });

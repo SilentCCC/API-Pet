@@ -1,6 +1,6 @@
 {
   "name": "api-pet",
-  "version": "0.1.121",
+  "version": "0.1.123",
   "description": "A cute Windows desktop pet that provides a local AI API gateway.",
   "main": "src/main.js",
   "scripts": {

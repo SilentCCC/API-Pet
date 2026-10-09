@@ -215,7 +215,20 @@ function loadState() {
   catch { return defaultState(); }
 }
 let state = loadState();
-function persist() { fs.mkdirSync(path.dirname(dataPath()), { recursive: true }); fs.writeFileSync(dataPath(), JSON.stringify(state, null, 2)); }
+function persist() {
+  const target = dataPath();
+  try {
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    // Windows can retain the ReadOnly attribute on files copied from a backup
+    // or restored by sync software. Clear it before overwriting saved state.
+    if (fs.existsSync(target)) fs.chmodSync(target, 0o666);
+    fs.writeFileSync(target, JSON.stringify(state, null, 2));
+    return true;
+  } catch (error) {
+    writeStartupLog('状态保存失败', error);
+    return false;
+  }
+}
 function safeState() { return { ...JSON.parse(JSON.stringify(state)), appVersion: app.getVersion() }; }
 function cleanBaseUrl(url) { return String(url || '').replace(/\/+$/, ''); }
 function todayKey() {
@@ -1236,6 +1249,17 @@ ipcMain.handle('save-provider', (_e, input) => {
 });
 ipcMain.handle('delete-provider', (_e, id) => { state.providers = state.providers.filter(p => p.id !== id); Object.keys(state.routes).forEach(m => { if (state.routes[m] === id) delete state.routes[m]; }); if (state.unifiedRoute.providerId === id) state.unifiedRoute = { providerId: '', apiKey: '', model: '', models: [] }; persist(); return safeState(); });
 ipcMain.handle('test-provider', (_e, id) => testProvider(id));
+ipcMain.handle('test-provider-key', async (_e, input = {}) => {
+  const apiKey = String(input.apiKey || '').trim();
+  if (!apiKey) return { ok: false, error: '请先填写 API Key' };
+  try {
+    const provider = normalizeProvider({ ...(input.provider || {}), apiKey, apiKeys: [{ key: apiKey, enabled: true }] });
+    const models = await fetchModels(provider, apiKey);
+    return { ok: true, models };
+  } catch (error) {
+    return { ok: false, error: String(error?.message || error) };
+  }
+});
 ipcMain.handle('move-provider', (_e, input) => {
   const index = state.providers.findIndex(provider => provider.id === input?.id);
   const target = Number.isInteger(input?.targetIndex) ? input.targetIndex : -1;
@@ -1243,6 +1267,17 @@ ipcMain.handle('move-provider', (_e, input) => {
   const [provider] = state.providers.splice(index, 1);
   state.providers.splice(target, 0, provider);
   persist();
+  return safeState();
+});
+ipcMain.handle('set-provider-order', (_e, ids) => {
+  if (!Array.isArray(ids)) return safeState();
+  const currentIds = state.providers.map(provider => provider.id);
+  const requestedIds = ids.map(id => String(id));
+  if (requestedIds.length !== currentIds.length || new Set(requestedIds).size !== currentIds.length
+      || requestedIds.some(id => !currentIds.includes(id))) return safeState();
+  const providers = new Map(state.providers.map(provider => [provider.id, provider]));
+  state.providers = requestedIds.map(id => providers.get(id));
+  if (requestedIds.some((id, index) => id !== currentIds[index])) persist();
   return safeState();
 });
 ipcMain.handle('refresh-provider-balance', (_e, id) => queryProviderBalance(id));

@@ -3,6 +3,8 @@ contextBridge.exposeInMainWorld('apiPet', {
   detectProviderCurrency: provider => ipcRenderer.invoke('detect-provider-currency', provider),
   setChatFormat: format => ipcRenderer.invoke('set-chat-format', format),
   moveProvider: data => ipcRenderer.invoke('move-provider', data),
+  setProviderOrder: ids => ipcRenderer.invoke('set-provider-order', ids),
+  testProviderKey: data => ipcRenderer.invoke('test-provider-key', data),
   generateImages: data => ipcRenderer.invoke('generate-images', data),
   saveGeneratedImage: url => ipcRenderer.invoke('save-generated-image', url),
   showGeneratedImageMenu: url => ipcRenderer.invoke('show-generated-image-menu', url),

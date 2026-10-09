@@ -38,6 +38,12 @@ let expandedProviderIds = new Set(JSON.parse(localStorage.getItem('api-pet-expan
 let providerTokenRows = [];
 let providerDrag = null;
 let providerOrderSaving = false;
+let providerSort = { key: '', direction: 1 };
+const providerNameCollators = {
+  latin: new Intl.Collator('en', { numeric: true, sensitivity: 'base' }),
+  han: new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' }),
+  other: new Intl.Collator('zh-CN', { numeric: true, sensitivity: 'base' })
+};
 let draftAccountData = null;
 let currencyDetectionToken = 0;
 let draftDetectedCurrency = '';
@@ -322,9 +328,79 @@ function ensureProviderToggle() {
   refreshBalances.className = 'ghost small';
   refreshBalances.textContent = '一键刷新余额';
   refreshBalances.onclick = refreshAllProviderBalances;
-  actions.append(refreshAccounts, refreshBalances, toggle, addButton);
+  const sortByName = document.createElement('button');
+  sortByName.id = 'sortProvidersByName';
+  sortByName.type = 'button';
+  sortByName.className = 'ghost small';
+  sortByName.onclick = () => sortProviders('name');
+  const sortByBalance = document.createElement('button');
+  sortByBalance.id = 'sortProvidersByBalance';
+  sortByBalance.type = 'button';
+  sortByBalance.className = 'ghost small';
+  sortByBalance.onclick = () => sortProviders('balance');
+  const sortActions = document.createElement('div');
+  sortActions.className = 'provider-sort-actions';
+  sortActions.append(sortByName, sortByBalance);
+  actions.append(refreshAccounts, refreshBalances, toggle, addButton, sortActions);
   title.classList.add('provider-heading');
   title.appendChild(actions);
+}
+function updateProviderSortButtons() {
+  const direction = providerSort.direction > 0 ? '↑' : '↓';
+  const name = $('sortProvidersByName');
+  const balance = $('sortProvidersByBalance');
+  if (name) name.textContent = `名称排序 ${providerSort.key === 'name' ? direction : '↕'}`;
+  if (balance) balance.textContent = `余额排序 ${providerSort.key === 'balance' ? direction : '↕'}`;
+  if (name) name.setAttribute('aria-label', `按名称${providerSort.key === 'name' && providerSort.direction < 0 ? '降序' : '升序'}排序`);
+  if (balance) balance.setAttribute('aria-label', `按余额${providerSort.key === 'balance' && providerSort.direction < 0 ? '降序' : '升序'}排序`);
+}
+function compareProviderNames(leftName, rightName) {
+  const left = String(leftName || '').trim();
+  const right = String(rightName || '').trim();
+  const leftFirst = Array.from(left)[0] || '';
+  const rightFirst = Array.from(right)[0] || '';
+  const category = value => {
+    if (/^[0-9]$/.test(value)) return 0;
+    if (/^[A-Za-z]$/.test(value)) return 1;
+    if (/^[\u3400-\u9fff]$/.test(value)) return 2;
+    return 3;
+  };
+  const leftCategory = category(leftFirst);
+  const rightCategory = category(rightFirst);
+  if (leftCategory !== rightCategory) return leftCategory - rightCategory;
+  const collator = leftCategory === 1 ? providerNameCollators.latin
+    : leftCategory === 2 ? providerNameCollators.han : providerNameCollators.other;
+  return collator.compare(left, right);
+}
+async function sortProviders(key) {
+  if (providerOrderSaving || !appState.providers.length) return;
+  if (providerSort.key === key) providerSort.direction *= -1;
+  else { providerSort.key = key; providerSort.direction = 1; }
+  const direction = providerSort.direction;
+  const value = provider => {
+    if (key === 'name') return String(provider.name || '').trim();
+    const amount = Number(provider.balance?.balance);
+    return Number.isFinite(amount) ? amount : direction > 0 ? Infinity : -Infinity;
+  };
+  const ordered = appState.providers
+    .map((provider, index) => ({ provider, index }))
+    .sort((a, b) => {
+      const left = value(a.provider);
+      const right = value(b.provider);
+      const comparison = (key === 'name' ? compareProviderNames(left, right) : left - right) * direction;
+      return comparison || a.index - b.index;
+    })
+    .map(item => item.provider);
+  providerOrderSaving = true;
+  try {
+    appState = await window.apiPet.setProviderOrder(ordered.map(provider => provider.id));
+    render();
+  } catch (error) {
+    toast(`排序失败：${error?.message || error}`);
+  } finally {
+    providerOrderSaving = false;
+    updateProviderSortButtons();
+  }
 }
 function updateBalanceRefreshButtons() {
   const disabled = refreshingAllBalances || appState.providers.every(provider => provider.balanceAdapter === 'none');
@@ -364,6 +440,7 @@ function render() {
   const allProvidersCollapsed = providersCollapsed || (appState.providers.length > 0 && appState.providers.every(provider => collapsedProviderIds.has(provider.id)));
   $('refreshAllAccounts').disabled = refreshingAllAccounts || appState.providers.every(provider => !['sub2api', 'new-api', 'aihub'].includes(provider.balanceAdapter));
   updateBalanceRefreshButtons();
+  updateProviderSortButtons();
   $('toggleProviders').textContent = allProvidersCollapsed ? '展开全部' : '折叠全部';
   $('toggleProviders').setAttribute('aria-expanded', String(!allProvidersCollapsed));
   const list = $('providers');
@@ -679,7 +756,7 @@ function ensureTokenRemarkField() {
 function renderTokenRows() {
   const fields = $('tokenFields');
   if (!fields) return;
-  fields.innerHTML = `<div class="token-row token-header"><span></span><div class="token-column-head"><span class="token-field-title">API Key</span></div><div class="token-column-head"><span class="token-field-title">令牌备注</span></div><div class="token-row-actions token-header-actions"><button type="button" id="importProviderTokens" class="ghost small token-import">导入令牌</button></div></div>${providerTokenRows.map((row, index) => `<div class="token-row" data-token-index="${index}"><input class="token-enabled" type="checkbox" title="使用此 API Key" ${row.enabled !== false ? 'checked' : ''}><div class="token-column"><div class="secret-input"><input id="token-key-${index}" class="token-key" type="password" value="${escapeHtml(row.key)}" placeholder="sk-xxxxxxxx"><button type="button" class="toggle-token-key toggle-secret" aria-label="显示 API Key" title="显示 API Key"><span class="eye-icon" aria-hidden="true"></span></button></div></div><div class="token-column"><input id="token-remark-${index}" class="token-remark" value="${escapeHtml(row.remark)}" placeholder="例如 主账号 / GPT 专用"></div><div class="token-row-actions"><div class="token-row-action-buttons"><button type="button" class="add-token" title="增加 API Key">＋</button><button type="button" class="remove-token" title="删除 API Key" ${providerTokenRows.length <= 1 ? 'disabled' : ''}>−</button></div></div></div>`).join('')}`;
+  fields.innerHTML = `<div class="token-row token-header"><span></span><div class="token-column-head"><span class="token-field-title">API Key</span></div><div class="token-column-head"><span class="token-field-title">令牌备注</span></div><div class="token-row-actions token-header-actions"><button type="button" id="importProviderTokens" class="ghost small token-import">导入令牌</button></div></div>${providerTokenRows.map((row, index) => `<div class="token-row" data-token-index="${index}"><input class="token-enabled" type="checkbox" title="使用此 API Key" ${row.enabled !== false ? 'checked' : ''}><div class="token-column"><div class="secret-input"><input id="token-key-${index}" class="token-key" type="password" value="${escapeHtml(row.key)}" placeholder="sk-xxxxxxxx"><button type="button" class="toggle-token-key toggle-secret" aria-label="显示 API Key" title="显示 API Key"><span class="eye-icon" aria-hidden="true"></span></button></div></div><div class="token-column"><input id="token-remark-${index}" class="token-remark" value="${escapeHtml(row.remark)}" placeholder="例如 主账号 / GPT 专用"></div><div class="token-row-actions"><div class="token-row-action-buttons"><button type="button" class="test-token" title="立即测试此 API Key" aria-label="立即测试此 API Key">ϟ</button><button type="button" class="add-token" title="增加 API Key">＋</button><button type="button" class="remove-token" title="删除 API Key" ${providerTokenRows.length <= 1 ? 'disabled' : ''}>−</button></div></div></div>`).join('')}`;
   $('importProviderTokens')?.addEventListener('click', importProviderTokens);
   fields.querySelectorAll('.token-row[data-token-index]').forEach(row => {
     const index = Number(row.dataset.tokenIndex);
@@ -699,8 +776,34 @@ function renderTokenRows() {
       renderTokenRows();
     };
     row.querySelector('.toggle-token-key').onclick = () => { const input = row.querySelector('.token-key'); input.type = input.type === 'password' ? 'text' : 'password'; };
+    row.querySelector('.test-token').onclick = () => testProviderToken(index, row.querySelector('.test-token'));
   });
   updateProviderTypeFields();
+}
+async function testProviderToken(index, button) {
+  const key = String($(`token-key-${index}`)?.value || providerTokenRows[index]?.key || '').trim();
+  if (!key) { toast('请先填写 API Key'); return; }
+  button.disabled = true;
+  button.textContent = '…';
+  button.title = '正在测试此 API Key';
+  try {
+    const result = await window.apiPet.testProviderKey({ provider: collectProviderDraft(), apiKey: key });
+    if (result.ok) {
+      button.textContent = '✓';
+      button.title = `测试成功，获取 ${result.models.length} 个模型`;
+      toast(`API Key 可用，获取 ${result.models.length} 个模型`);
+    } else {
+      button.textContent = '×';
+      button.title = `测试失败：${result.error}`;
+      toast(`API Key 测试失败：${result.error}`);
+    }
+  } catch (error) {
+    button.textContent = '×';
+    button.title = `测试失败：${error?.message || error}`;
+    toast(`API Key 测试失败：${error?.message || error}`);
+  } finally {
+    button.disabled = false;
+  }
 }
 function recognizeProviderQuickEntry() {
   const text = $('quickEntry').value.trim();
@@ -1460,7 +1563,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   const dialogToast = document.createElement('div');
   dialogToast.id = 'dialogToast';
   dialogToast.className = 'dialog-toast';
-  dialog.querySelector('.dialog-head')?.after(dialogToast);
+  dialog.appendChild(dialogToast);
   ensureChatTargetMenu();
   setupPanelHeightResize();
   setupPanelWidthResize();

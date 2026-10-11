@@ -2,6 +2,7 @@ const crypto = require('node:crypto');
 const fs = require('node:fs');
 const path = require('node:path');
 const { accountContext } = require('./account-session-context');
+const { attachNetworkDiagnostics } = require('./network-diagnostics');
 
 const credentialKeys = ['accountToken', 'accountRefreshToken', 'accountCookie', 'accountUserId', 'accountSession'];
 const credentialsOf = provider => Object.fromEntries(credentialKeys.map(key => [key, provider[key] || '']));
@@ -50,7 +51,12 @@ class AccountSessions {
   entry(provider) {
     const partition = partitionFor(provider);
     if (!this.entries.has(partition)) {
-      this.entries.set(partition, { partition, origin: originOf(provider), session: this.session.fromPartition(partition),
+      const accountSession = this.session.fromPartition(partition);
+      attachNetworkDiagnostics(accountSession, {
+        logFile: path.join(this.dataDirectory(), 'electron-network.log'),
+        context: `account-session:${originOf(provider) || 'unknown-origin'}`
+      });
+      this.entries.set(partition, { partition, origin: originOf(provider), session: accountSession,
         windows: new Set(), windowProviders: new Map(), queue: Promise.resolve(), seen: new Set() });
     }
     return this.entries.get(partition);

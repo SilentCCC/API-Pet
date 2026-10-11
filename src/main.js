@@ -9,6 +9,7 @@ const { requestImage, imageData } = require('./image-generation');
 const { detectMime } = require('./image-format');
 const { AccountSessions, originOf, credentialsOf } = require('./account-sessions');
 const { configureAccountSessions } = require('./account-session-context');
+const { attachNetworkDiagnostics } = require('./network-diagnostics');
 const accountSessions = new AccountSessions({ session, BrowserWindow, ipcMain,
   dataDirectory: () => app.getPath('userData'), readCredentials: readSub2apiCredentials,
   onChanged: (provider, previousCredentials) => {
@@ -1048,7 +1049,15 @@ function startGateway() {
   });
   gateway.listen(PORT, '127.0.0.1');
 }
-if (gotSingleInstanceLock) app.whenReady().then(() => { writeStartupLog(`API Pet ${app.getVersion()} 启动`); persist(); startGateway(); makeWindow(); createTray(); scheduleBalanceRefresh(); refreshAllBalances().catch(error => writeStartupLog('余额刷新失败', error)); }).catch(error => writeStartupLog('应用启动失败', error));
+if (gotSingleInstanceLock) app.whenReady().then(() => {
+  writeStartupLog(`API Pet ${app.getVersion()} 启动`);
+  attachNetworkDiagnostics(session.defaultSession, {
+    logFile: path.join(app.getPath('userData'), 'electron-network.log'),
+    context: 'default-session'
+  });
+  persist(); startGateway(); makeWindow(); createTray(); scheduleBalanceRefresh();
+  refreshAllBalances().catch(error => writeStartupLog('余额刷新失败', error));
+}).catch(error => writeStartupLog('应用启动失败', error));
 app.on('window-all-closed', (e) => { if (!isQuitting) e.preventDefault(); });
 app.on('before-quit', () => { isQuitting = true; });
 app.on('will-quit', () => { tray?.destroy(); gateway?.close(); });

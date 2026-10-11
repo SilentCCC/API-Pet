@@ -340,15 +340,23 @@ function ensureProviderToggle() {
   sortByBalance.onclick = () => sortProviders('balance');
   const sortActions = document.createElement('div');
   sortActions.className = 'provider-sort-actions';
-  sortActions.append(sortByName, sortByBalance);
+  const providerCount = document.createElement('span');
+  providerCount.id = 'providerCount';
+  providerCount.className = 'provider-count';
+  const sortButtonGroup = document.createElement('div');
+  sortButtonGroup.className = 'provider-sort-button-group';
+  sortButtonGroup.append(sortByName, sortByBalance);
+  sortActions.append(providerCount, sortButtonGroup);
   actions.append(refreshAccounts, refreshBalances, toggle, addButton, sortActions);
   title.classList.add('provider-heading');
   title.appendChild(actions);
 }
 function updateProviderSortButtons() {
   const direction = providerSort.direction > 0 ? '↑' : '↓';
+  const providerCount = $('providerCount');
   const name = $('sortProvidersByName');
   const balance = $('sortProvidersByBalance');
+  if (providerCount) providerCount.textContent = `已收录站点:${appState?.providers?.length || 0}个`;
   if (name) name.textContent = `名称排序 ${providerSort.key === 'name' ? direction : '↕'}`;
   if (balance) balance.textContent = `余额排序 ${providerSort.key === 'balance' ? direction : '↕'}`;
   if (name) name.setAttribute('aria-label', `按名称${providerSort.key === 'name' && providerSort.direction < 0 ? '降序' : '升序'}排序`);
@@ -1157,6 +1165,18 @@ function renderChatTargetMenu() {
 function currentDrawingModel() {
   return currentChatModel();
 }
+function drawingRequestLabel(model) {
+  const labels = {
+    generic: 'Openai兼容格式',
+    gemini: 'Gemini格式',
+    seedream: 'Seedream格式',
+    grok: 'Grok格式',
+    'grok-json': 'Grok JSON格式',
+    'sense-lite': 'SenseNova格式',
+    'sense-fast': 'SenseNova格式'
+  };
+  return labels[imageConfig.modelKind(model)] || 'Openai兼容格式';
+}
 function renderDrawingParameters() {
   let parameters = $('drawingParameters');
   if (!parameters) {
@@ -1216,7 +1236,7 @@ function updateChatModelLabel() {
   const site = getChatSite();
   const targetLabel = site ? `${site.name} · ${model}` : model;
   $('chatModelLabel').textContent = enabled && model
-    ? `${targetLabel}${drawing ? ` · ${chatImages.length ? '图生图' : '文生图'}` : ''}` : '请先选择可用模型';
+    ? `${targetLabel}${drawing ? ` · ${chatImages.length ? '图生图' : '文生图'} · ${drawingRequestLabel(model)}` : ''}` : '请先选择可用模型';
   $('chatModelLabel').title = $('chatModelLabel').textContent;
   $('chatFormat').value = currentChatFormat();
   $('chatFormat').classList.toggle('hidden', drawing);

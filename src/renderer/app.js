@@ -333,6 +333,11 @@ function ensureProviderToggle() {
   sortByName.type = 'button';
   sortByName.className = 'ghost small';
   sortByName.onclick = () => sortProviders('name');
+  const sortByConsumption = document.createElement('button');
+  sortByConsumption.id = 'sortProvidersByConsumption';
+  sortByConsumption.type = 'button';
+  sortByConsumption.className = 'ghost small';
+  sortByConsumption.onclick = () => sortProviders('consumption');
   const sortByBalance = document.createElement('button');
   sortByBalance.id = 'sortProvidersByBalance';
   sortByBalance.type = 'button';
@@ -345,7 +350,7 @@ function ensureProviderToggle() {
   providerCount.className = 'provider-count';
   const sortButtonGroup = document.createElement('div');
   sortButtonGroup.className = 'provider-sort-button-group';
-  sortButtonGroup.append(sortByName, sortByBalance);
+  sortButtonGroup.append(sortByConsumption, sortByName, sortByBalance);
   sortActions.append(providerCount, sortButtonGroup);
   actions.append(refreshAccounts, refreshBalances, toggle, addButton, sortActions);
   title.classList.add('provider-heading');
@@ -354,11 +359,14 @@ function ensureProviderToggle() {
 function updateProviderSortButtons() {
   const direction = providerSort.direction > 0 ? '↑' : '↓';
   const providerCount = $('providerCount');
+  const consumption = $('sortProvidersByConsumption');
   const name = $('sortProvidersByName');
   const balance = $('sortProvidersByBalance');
   if (providerCount) providerCount.textContent = `已收录站点:${appState?.providers?.length || 0}个`;
+  if (consumption) consumption.textContent = `今日消耗排序 ${providerSort.key === 'consumption' ? direction : '↕'}`;
   if (name) name.textContent = `名称排序 ${providerSort.key === 'name' ? direction : '↕'}`;
   if (balance) balance.textContent = `余额排序 ${providerSort.key === 'balance' ? direction : '↕'}`;
+  if (consumption) consumption.setAttribute('aria-label', `按今日消耗${providerSort.key === 'consumption' && providerSort.direction < 0 ? '降序' : '升序'}排序`);
   if (name) name.setAttribute('aria-label', `按名称${providerSort.key === 'name' && providerSort.direction < 0 ? '降序' : '升序'}排序`);
   if (balance) balance.setAttribute('aria-label', `按余额${providerSort.key === 'balance' && providerSort.direction < 0 ? '降序' : '升序'}排序`);
 }
@@ -387,6 +395,13 @@ async function sortProviders(key) {
   const direction = providerSort.direction;
   const value = provider => {
     if (key === 'name') return String(provider.name || '').trim();
+    if (key === 'consumption') {
+      if (provider.balanceAdapter === 'none') return null;
+      const accountCost = Number(provider.accountStats?.todayCost);
+      const localCost = Number(provider.dailyStats?.cost);
+      const amount = Number.isFinite(accountCost) ? accountCost : localCost;
+      return Number.isFinite(amount) ? amount : null;
+    }
     const amount = Number(provider.balance?.balance);
     return Number.isFinite(amount) ? amount : direction > 0 ? Infinity : -Infinity;
   };
@@ -395,6 +410,11 @@ async function sortProviders(key) {
     .sort((a, b) => {
       const left = value(a.provider);
       const right = value(b.provider);
+      if (key === 'consumption') {
+        const leftMissing = left == null;
+        const rightMissing = right == null;
+        if (leftMissing !== rightMissing) return leftMissing ? 1 : -1;
+      }
       const comparison = (key === 'name' ? compareProviderNames(left, right) : left - right) * direction;
       return comparison || a.index - b.index;
     })

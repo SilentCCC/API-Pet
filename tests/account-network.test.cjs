@@ -105,6 +105,28 @@ test('New API user logs provide today usage when performance stats are admin-onl
   assert.equal(result.accountStats.averageDurationMs, 19000);
 });
 
+test('New API current-day logs clear stale performance statistics when the dashboard is empty', async () => {
+  const adapterSource = fs.readFileSync(path.join(__dirname, '../src/providers/new-api.js'), 'utf8');
+  const context = vm.createContext({
+    module: { exports: {} }, URL, URLSearchParams, AbortController, setTimeout, clearTimeout, Date,
+    require: () => ({ ...require('../src/providers/base'), accountFetch: async url => {
+      const pathname = new URL(url).pathname;
+      const reply = (body, status = 200) => new Response(JSON.stringify(body), { status });
+      if (pathname === '/api/user/self') return reply({ success: true, data: { quota: 500000 } });
+      if (pathname === '/api/performance/stats') return reply({ success: true, data: { today_cost: 70000, today_requests: 14, today_tokens: 32558, average_duration_ms: 24000 } });
+      if (pathname === '/api/performance/logs') return reply({ success: true, data: { items: [] } });
+      if (pathname === '/api/log/self') return reply({ success: true, data: { page: 1, page_size: 100, total: 0, items: [] } });
+      throw new Error(`unexpected request: ${pathname}`);
+    } })
+  });
+  vm.runInContext(adapterSource, context);
+  const result = await context.module.exports.getBalance({ loginUrl: 'https://account.test', accountToken: 'test-token', accountUserId: '123' });
+  assert.equal(result.accountStats.todayCost, 0);
+  assert.equal(result.accountStats.todayRequests, 0);
+  assert.equal(result.accountStats.todayTokens, 0);
+  assert.equal(result.accountStats.averageDurationMs, undefined);
+});
+
 test('New API overlapping balance queries and key imports share refresh cookie rotation', async () => {
   const source = fs.readFileSync(path.join(__dirname, '../src/providers/new-api.js'), 'utf8');
   let refreshCount = 0;

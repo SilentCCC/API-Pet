@@ -212,41 +212,43 @@ function todayStart() {
 }
 
 function statsFromPayload(stats, logs) {
+  // The dashboard uses the user's current-day log query. Performance stats can
+  // be stale or use a different date boundary, so never let them override logs.
   const todayCost = normalizeCost(findNumber(stats, ['today_cost', 'todayCost', 'today_spend', 'todaySpend', 'daily_cost', 'dailyCost', 'today_quota', 'todayQuota']));
   const todayRequests = parseNumber(findNumber(stats, ['today_requests', 'todayRequests', 'today_request_count', 'todayRequestCount', 'request_count', 'requestCount', 'requests']));
   const todayTokens = parseNumber(findNumber(stats, ['today_tokens', 'todayTokens', 'total_tokens', 'totalTokens', 'tokens']));
   const averageDurationMs = normalizeDuration(findNumber(stats, ['average_duration_ms', 'averageDurationMs', 'avg_duration_ms', 'avgDurationMs', 'average_latency', 'avg_latency']));
   const entries = findCollection(logs, ['logs', 'items', 'records']) || [];
-  if (!entries.length) return { todayCost, todayRequests, todayTokens, averageDurationMs };
   const today = entries.filter(entry => {
     const raw = entry?.created_at || entry?.createdAt || entry?.time || entry?.timestamp || entry?.date;
     if (!raw) return true;
     const timestamp = typeof raw === 'number' ? (raw < 1e12 ? raw * 1000 : raw) : Date.parse(raw);
-    return !Number.isFinite(timestamp) || timestamp >= todayStart();
+    return !Number.isFinite(timestamp) || (timestamp >= todayStart() && timestamp <= Date.now());
   });
-  const rows = today.length ? today : entries;
+  const rows = today;
   const usageRows = rows.filter(row => {
     const type = parseNumber(row?.type);
     if (type != null) return type === 2;
     return ['quota', 'cost', 'spend', 'amount', 'prompt_tokens', 'completion_tokens', 'total_tokens', 'tokens']
       .some(key => parseNumber(row?.[key]) > 0);
   });
-  const countedRows = usageRows.length ? usageRows : rows;
+  const hasTypedRows = rows.some(row => parseNumber(row?.type) != null);
+  const countedRows = usageRows.length ? usageRows : hasTypedRows ? [] : rows;
   const usageSum = keys => countedRows.reduce((total, row) => {
     const raw = keys.map(key => row?.[key]).find(value => value != null);
     return total + (parseNumber(raw) || 0);
   }, 0);
-  const logCost = countedRows.length ? normalizeCost(usageSum(['cost', 'quota', 'spend', 'amount'])) : null;
+  const logCost = countedRows.length ? normalizeCost(usageSum(['cost', 'quota', 'spend', 'amount'])) : 0;
   const logTokens = countedRows.length ? countedRows.reduce((total, row) => {
     const combined = parseNumber(row?.total_tokens ?? row?.totalTokens);
     return total + (combined != null ? combined : (parseNumber(row?.prompt_tokens ?? row?.input_tokens) || 0) + (parseNumber(row?.completion_tokens ?? row?.output_tokens) || 0));
-  }, 0) : null;
+  }, 0) : 0;
   const durations = countedRows.map(row => normalizeDuration(row?.duration_ms ?? row?.durationMs ?? row?.duration ?? row?.use_time ?? row?.latency_ms)).filter(Number.isFinite);
   return {
-    todayCost: todayCost ?? (logCost > 0 ? logCost : null),
-    todayRequests: todayRequests ?? countedRows.length,
-    todayTokens: todayTokens ?? (logTokens > 0 ? logTokens : null),
-    averageDurationMs: averageDurationMs ?? (durations.length ? durations.reduce((a, b) => a + b, 0) / durations.length : null)
+    todayCost: logCost,
+    todayRequests: countedRows.length,
+    todayTokens: logTokens,
+    averageDurationMs: durations.length ? durations.reduce((a, b) => a + b, 0) / durations.length : null
   };
 }
 
@@ -330,9 +332,9 @@ module.exports = {
         getJson(`${origin}/api/performance/stats`, request.headers, controller.signal, 'GET', request.refresh).then(value => { stats = value; }).catch(() => {}),
         getJson(`${origin}/api/performance/logs`, request.headers, controller.signal, 'GET', request.refresh).then(value => { logs = value; }).catch(() => {})
       ]);
-      if (!findCollection(logs, ['logs', 'items', 'records'])?.length) {
-        logs = await getTodayLogs(origin, request, controller).catch(() => null);
-      }
+      // Always use the same current-day endpoint as the user dashboard. An
+      // empty response is meaningful and must clear stale saved statistics.
+      logs = await getTodayLogs(origin, request, controller).catch(() => null);
       const parsedStats = statsFromPayload(stats, logs);
       const accountStats = Object.fromEntries(Object.entries(parsedStats).filter(([, value]) => value != null && Number.isFinite(Number(value))));
       return {

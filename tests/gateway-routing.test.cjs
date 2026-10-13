@@ -30,7 +30,7 @@ async function gateway(t, options = {}) {
       return options.response?.() || Response.json({ output_text: 'test reply' });
     }
   });
-  ['unifiedRouteKey', 'resolveRequestedModel', 'findProviderForModel', 'allModels', 'authOk', 'writeJson', 'proxyChat', 'startGateway'].forEach(name => include(context, name));
+  ['unifiedRouteKey', 'resolveRequestedModel', 'findProviderForModel', 'allModels', 'gatewayCredential', 'authOk', 'writeJson', 'proxyChat', 'startGateway'].forEach(name => include(context, name));
   context.startGateway();
   const server = context.gateway;
   t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
@@ -114,6 +114,32 @@ test('model routing also follows the client endpoint', async t => {
   }
 });
 
+test('site Key route maps the local API Pet Key to the selected site Key', async t => {
+  const provider = { id: 'site-a', models: [], apiKey: 'site-a-key', apiKeys: [{ key: 'site-a-key', enabled: true }], apiKeyModels: { 'site-a-key': ['a-model'] }, requestUrl: 'https://site-a.test/v1' };
+  const state = { routingEnabled: true, routingMode: 'key', routes: {}, providers: [provider], unifiedKey: 'local-key', keyRoute: { providerId: 'site-a', apiKey: 'site-a-key', models: ['a-model'] } };
+  const calls = [];
+  const context = vm.createContext({ state, http, PORT: 0, Buffer, console, mainWindow: null,
+    providerModels: item => item.models, providerBaseUrls: item => [item.requestUrl], selectProviderApiKey: item => item.apiKey,
+    recordProviderRequest() {}, recordProviderResult() {}, persist() {}, extractUsage: () => ({}),
+    fetch: async (url, request) => { calls.push({ url, headers: request.headers, body: JSON.parse(request.body) }); return Response.json({ output_text: 'ok' }); }
+  });
+  ['cleanBaseUrl', 'providerModels', 'providerBaseUrls', 'selectProviderApiKey', 'modelsForApiKey', 'gatewayCredential', 'unifiedRouteKey', 'resolveRequestedModel', 'findProviderForModel', 'allModels', 'authOk', 'writeJson', 'proxyChat', 'startGateway'].forEach(name => include(context, name));
+  context.startGateway();
+  const server = context.gateway;
+  t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
+  await new Promise((resolve, reject) => { server.once('listening', resolve); server.once('error', reject); });
+  const base = `http://127.0.0.1:${server.address().port}/v1`;
+  const send = (endpoint, body, key = 'local-key') => fetch(base + endpoint, { method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body) });
+  const models = await fetch(base + '/models', { headers: { Authorization: 'Bearer local-key' } });
+  assert.deepEqual((await models.json()).data.map(item => item.id), ['a-model']);
+  const routed = await send('/responses', { model: 'a-model', input: 'test' });
+  assert.equal(routed.status, 200, await routed.clone().text());
+  assert.equal(calls[0].headers.Authorization, 'Bearer site-a-key');
+  assert.equal(calls[0].url, 'https://site-a.test/v1/responses');
+  assert.equal((await send('/responses', { model: 'other-model' })).status, 404);
+  assert.equal((await send('/responses', { model: 'a-model' }, 'site-a-key')).status, 401);
+});
+
 test('legacy configuration retains route target and internal chat format separately', () => {
   for (const format of ['chat/completions', 'responses']) {
     const saved = { routingMode: 'unified', unifiedRoute: { providerId: 'test', model: 'upstream-model', format }, providers: [{ id:'test', models:['upstream-model'], apiKeys:[{key:'legacy-key',enabled:true}] }] };
@@ -123,6 +149,7 @@ test('legacy configuration retains route target and internal chat format separat
     include(context, 'selectProviderApiKey');
     include(context, 'unifiedRouteKey');
     include(context, 'normalizeUnifiedRoute');
+    include(context, 'normalizeKeyRoute');
     include(context, 'loadState');
     const loaded = context.loadState();
     assert.equal(loaded.chatFormat, format);

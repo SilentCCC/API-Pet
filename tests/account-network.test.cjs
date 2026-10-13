@@ -54,7 +54,7 @@ test('New API balance and token imports also use the account network transport',
   const source = fs.readFileSync(path.join(__dirname, '../src/providers/new-api.js'), 'utf8');
   const calls = [];
   const context = vm.createContext({
-    module: { exports: {} }, URL, AbortController, setTimeout, clearTimeout,
+    module: { exports: {} }, URL, URLSearchParams, AbortController, setTimeout, clearTimeout,
     require: () => ({ ...require('../src/providers/base'), accountFetch: async (url, options) => {
       const pathname = new URL(url).pathname;
       calls.push(pathname);
@@ -126,6 +126,44 @@ test('New API current-day logs clear stale performance statistics when the dashb
   assert.equal(result.accountStats.todayTokens, 0);
   assert.equal(result.accountStats.averageDurationMs, undefined);
 });
+
+for (const [quota, expected] of [[1225100, 2.4502], [0, 0], [5000, 0.01]]) {
+  test(`New API dashboard quota ${quota} overrides the first 100 logs`, async () => {
+    const source = fs.readFileSync(path.join(__dirname, '../src/providers/new-api.js'), 'utf8');
+    const now = Math.floor(Date.now() / 1000);
+    // The first page totals $1.0944; the full-range summary includes 250 rows.
+    const items = Array.from({ length: 100 }, (_, index) => ({
+      type: 2, created_at: now, quota: index === 0 ? 7200 : 5454.545454545455,
+      prompt_tokens: 10, completion_tokens: 5, use_time: 2
+    }));
+    const calls = [];
+    const context = vm.createContext({
+      module: { exports: {} }, URL, URLSearchParams, AbortController, setTimeout, clearTimeout, Date,
+      require: () => ({ ...require('../src/providers/base'), accountFetch: async url => {
+        const request = new URL(url);
+        calls.push(request);
+        const data = request.pathname === '/api/user/self' ? { quota: 500000 }
+          : request.pathname === '/api/log/self/stat' ? { quota, rpm: 1, tpm: 15 }
+            : request.pathname === '/api/log/self' ? { items, total: 250, page: 1, page_size: 100 } : null;
+        assert.notEqual(data, null, `unexpected request: ${request.pathname}`);
+        return new Response(JSON.stringify({ success: true, data }));
+      } })
+    });
+    vm.runInContext(source, context);
+    const result = await context.module.exports.getBalance({ loginUrl: 'https://account.test', accountToken: 'test-token' });
+    assert.equal(result.accountStats.todayCost, expected);
+    assert.equal(result.balance, 1);
+    const summary = calls.find(request => request.pathname === '/api/log/self/stat');
+    const logs = calls.find(request => request.pathname === '/api/log/self');
+    for (const key of ['start_timestamp', 'end_timestamp']) {
+      assert.equal(summary.searchParams.get(key), logs.searchParams.get(key));
+    }
+    const midnight = new Date();
+    midnight.setHours(0, 0, 0, 0);
+    assert.equal(Number(summary.searchParams.get('start_timestamp')), Math.floor(midnight.getTime() / 1000));
+    assert.equal(calls.length, 3);
+  });
+}
 
 test('New API overlapping balance queries and key imports share refresh cookie rotation', async () => {
   const source = fs.readFileSync(path.join(__dirname, '../src/providers/new-api.js'), 'utf8');

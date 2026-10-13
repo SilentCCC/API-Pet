@@ -9,7 +9,7 @@ const currency = require('../src/provider-currency');
 function adapter(name, fetch) {
   const filename = path.join(__dirname, `../src/providers/${name}.js`);
   const realRequire = createRequire(filename);
-  const context = vm.createContext({ module: { exports: {} }, URL, AbortController, setTimeout, clearTimeout,
+  const context = vm.createContext({ module: { exports: {} }, URL, URLSearchParams, AbortController, setTimeout, clearTimeout,
     fetch, require: name => name === './base' ? { ...realRequire(name), accountFetch: fetch } : realRequire(name) });
   vm.runInContext(fs.readFileSync(filename, 'utf8'), context);
   return context.module.exports;

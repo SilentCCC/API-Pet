@@ -211,13 +211,10 @@ function todayStart() {
   return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
 }
 
-function statsFromPayload(stats, logs) {
-  // The dashboard uses the user's current-day log query. Performance stats can
-  // be stale or use a different date boundary, so never let them override logs.
-  const todayCost = normalizeCost(findNumber(stats, ['today_cost', 'todayCost', 'today_spend', 'todaySpend', 'daily_cost', 'dailyCost', 'today_quota', 'todayQuota']));
-  const todayRequests = parseNumber(findNumber(stats, ['today_requests', 'todayRequests', 'today_request_count', 'todayRequestCount', 'request_count', 'requestCount', 'requests']));
-  const todayTokens = parseNumber(findNumber(stats, ['today_tokens', 'todayTokens', 'total_tokens', 'totalTokens', 'tokens']));
-  const averageDurationMs = normalizeDuration(findNumber(stats, ['average_duration_ms', 'averageDurationMs', 'avg_duration_ms', 'avgDurationMs', 'average_latency', 'avg_latency']));
+function statsFromPayload(summary, logs) {
+  // /log/self/stat supplies the dashboard's full-range cost, independently of
+  // the current page of logs. Its quota is always in New API internal units.
+  const summaryQuota = parseNumber(summary?.quota);
   const entries = findCollection(logs, ['logs', 'items', 'records']) || [];
   const today = entries.filter(entry => {
     const raw = entry?.created_at || entry?.createdAt || entry?.time || entry?.timestamp || entry?.date;
@@ -245,17 +242,23 @@ function statsFromPayload(stats, logs) {
   }, 0) : 0;
   const durations = countedRows.map(row => normalizeDuration(row?.duration_ms ?? row?.durationMs ?? row?.duration ?? row?.use_time ?? row?.latency_ms)).filter(Number.isFinite);
   return {
-    todayCost: logCost,
+    todayCost: summaryQuota != null ? summaryQuota / QUOTA_PER_DOLLAR : logCost,
     todayRequests: countedRows.length,
     todayTokens: logTokens,
     averageDurationMs: durations.length ? durations.reduce((a, b) => a + b, 0) / durations.length : null
   };
 }
 
-async function getTodayLogs(origin, request, controller) {
+function todayQuery() {
   const start = Math.floor(todayStart() / 1000);
   const end = Math.floor(Date.now() / 1000) + 1;
-  const query = new URLSearchParams({ p: '1', page_size: '100', start_timestamp: String(start), end_timestamp: String(end) });
+  return new URLSearchParams({ start_timestamp: String(start), end_timestamp: String(end) });
+}
+
+async function getTodayLogs(origin, request, controller, range) {
+  const query = new URLSearchParams(range);
+  query.set('p', '1');
+  query.set('page_size', '100');
   return getJson(`${origin}/api/log/self?${query}`, request.headers, controller.signal, 'GET', request.refresh);
 }
 
@@ -326,16 +329,12 @@ module.exports = {
       const rawBalance = findNumber(user, ['quota', 'remaining_quota', 'remainingQuota', 'balance', 'credit']);
       const balance = quotaAmount(rawBalance);
       if (balance == null) throw new Error('New API /api/user/self 响应中没有可识别的 quota 或 balance 字段');
-      let stats = null;
-      let logs = null;
-      await Promise.all([
-        getJson(`${origin}/api/performance/stats`, request.headers, controller.signal, 'GET', request.refresh).then(value => { stats = value; }).catch(() => {}),
-        getJson(`${origin}/api/performance/logs`, request.headers, controller.signal, 'GET', request.refresh).then(value => { logs = value; }).catch(() => {})
+      const range = todayQuery();
+      const [summary, logs] = await Promise.all([
+        getJson(`${origin}/api/log/self/stat?${range}`, request.headers, controller.signal, 'GET', request.refresh).catch(() => null),
+        getTodayLogs(origin, request, controller, range).catch(() => null)
       ]);
-      // Always use the same current-day endpoint as the user dashboard. An
-      // empty response is meaningful and must clear stale saved statistics.
-      logs = await getTodayLogs(origin, request, controller).catch(() => null);
-      const parsedStats = statsFromPayload(stats, logs);
+      const parsedStats = statsFromPayload(summary, logs);
       const accountStats = Object.fromEntries(Object.entries(parsedStats).filter(([, value]) => value != null && Number.isFinite(Number(value))));
       return {
         balance,

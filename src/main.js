@@ -192,6 +192,7 @@ function defaultState() {
     alwaysOnTop: true,
     chatFormat: 'responses',
     unifiedRoute: { providerId: '', apiKey: '', model: '', models: [] },
+    keyRoute: { providerId: '', apiKey: '', models: [] },
     balanceSettings: { lowThreshold: 5, refreshMinutes: 10 }
   };
 }
@@ -205,11 +206,12 @@ function loadState() {
       ...defaults,
       ...saved,
       routingEnabled: saved.routingEnabled === true,
-      routingMode: saved.routingMode || 'model',
+      routingMode: ['unified', 'model', 'key'].includes(saved.routingMode) ? saved.routingMode : 'model',
       alwaysOnTop: saved.alwaysOnTop !== false,
       balanceSettings: { ...defaults.balanceSettings, ...(saved.balanceSettings || {}) },
       chatFormat: (saved.chatFormat || (saved.routingMode === 'unified' ? saved.unifiedRoute?.format : '')) === 'chat/completions' ? 'chat/completions' : 'responses',
       unifiedRoute: normalizeUnifiedRoute({ ...saved.unifiedRoute, model: saved.unifiedRoute?.model || oldTarget }, providers),
+      keyRoute: normalizeKeyRoute(saved.keyRoute, providers),
       providers
     };
   }
@@ -304,6 +306,12 @@ function normalizeProvider(provider) {
   const selectedKey = apiKeys.find(item => item.enabled) || apiKeys[0] || { key: '', remark: '' };
   const selectedIndex = Math.max(0, apiKeys.findIndex(item => item === selectedKey));
   apiKeys.forEach((item, index) => { item.enabled = index === selectedIndex; });
+  const apiKeyModels = {};
+  if (provider.apiKeyModels && typeof provider.apiKeyModels === 'object' && !Array.isArray(provider.apiKeyModels)) {
+    apiKeys.forEach(item => {
+      if (Array.isArray(provider.apiKeyModels[item.key])) apiKeyModels[item.key] = [...new Set(provider.apiKeyModels[item.key].map(String).filter(Boolean))];
+    });
+  }
   return {
     ...provider,
     loginUrl,
@@ -311,6 +319,7 @@ function normalizeProvider(provider) {
     baseUrl: requestUrl || loginUrl,
     balanceAdapter,
     apiKeys,
+    apiKeyModels,
     apiKey: selectedKey.key,
     tokenRemark: selectedKey.remark,
     accountToken: provider.accountToken || '',
@@ -353,6 +362,12 @@ function normalizeUnifiedRoute(route = {}, providers = state.providers) {
   const apiKey = unifiedRouteKey(provider, route);
   const models = apiKey ? (Array.isArray(route.models) ? route.models : providerModels(provider)).slice() : [];
   return { providerId: provider?.id || '', apiKey, model: models.includes(route.model) ? route.model : '', models };
+}
+function normalizeKeyRoute(route = {}, providers = state.providers) {
+  const provider = providers.find(item => item.id === route.providerId);
+  const apiKey = provider?.apiKeys?.some(item => item.key === route.apiKey) ? route.apiKey : '';
+  const models = apiKey && Array.isArray(route.models) ? [...new Set(route.models.map(String).filter(Boolean))] : [];
+  return { providerId: provider?.id || '', apiKey, models };
 }
 function findProviderForModel(model) {
   const selected = state.routes[model];
@@ -400,6 +415,15 @@ async function fetchModels(provider, apiKeyOverride = '') {
     }
     throw lastError || new Error('无法获取模型列表');
   } finally { clearTimeout(timer); }
+}
+async function modelsForApiKey(provider, apiKey) {
+  const key = String(apiKey || '').trim();
+  if (!provider || !key) return [];
+  if (provider.apiKeyModels && Object.prototype.hasOwnProperty.call(provider.apiKeyModels, key)) return provider.apiKeyModels[key];
+  const models = await fetchModels(provider, key);
+  provider.apiKeyModels = { ...(provider.apiKeyModels || {}), [key]: models };
+  persist();
+  return models;
 }
 async function testProvider(id) {
   const provider = state.providers.find(p => p.id === id);
@@ -902,8 +926,24 @@ function makeWindow() {
   });
 }
 function authOk(req) {
-  const auth = req.headers.authorization || '';
-  return auth === `Bearer ${state.unifiedKey}` || req.headers['x-api-key'] === state.unifiedKey;
+  const key = gatewayCredential(req);
+  return key === state.unifiedKey;
+}
+function gatewayCredential(req) {
+  const auth = String(req.headers.authorization || '');
+  if (auth.startsWith('Bearer ')) return auth.slice(7).trim();
+  return String(req.headers['x-api-key'] || '').trim();
+}
+function providerForApiKey(apiKey) {
+  const key = String(apiKey || '').trim();
+  if (!key) return null;
+  const matches = [];
+  for (const provider of state.providers || []) {
+    for (const item of provider.apiKeys || []) {
+      if (item?.key === key) matches.push({ provider, apiKey: item.key });
+    }
+  }
+  return matches.length === 1 ? matches[0] : null;
 }
 function writeJson(res, status, body) { res.writeHead(status, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' }); res.end(JSON.stringify(body)); }
 async function directChatRequest(input = {}) {
@@ -973,16 +1013,26 @@ async function proxyChat(req, res, body, endpoint = '/chat/completions') {
   const requestedModel = body?.model;
   if (state.routingMode === 'unified' && requestedModel !== 'Pet model') return writeJson(res, 400, { error: { message: '当前为统一模型模式，请求模型必须是 Pet model', type: 'api_pet_mode_error' } });
   if (state.routingMode === 'model' && requestedModel === 'Pet model') return writeJson(res, 400, { error: { message: '当前为模型路由模式，请切换到统一模型模式后再请求 Pet model', type: 'api_pet_mode_error' } });
+  if (state.routingMode === 'key' && requestedModel === 'Pet model') return writeJson(res, 400, { error: { message: '当前为站点 Key 路由模式，请求模型必须使用站点真实模型名', type: 'api_pet_mode_error' } });
   const model = resolveRequestedModel(requestedModel);
   if (requestedModel === 'Pet model' && !model) return writeJson(res, 400, { error: { message: '统一模型尚未选择目标模型', type: 'api_pet_virtual_model_error' } });
   const requestedProviderId = String(body?.api_pet_provider_id || '').trim();
-  const provider = requestedModel === 'Pet model'
+  const selectedKeyRoute = state.routingMode === 'key' ? state.keyRoute : null;
+  const keyRouteProvider = selectedKeyRoute && state.providers.find(item => item.id === selectedKeyRoute.providerId);
+  if (state.routingMode === 'key' && (!keyRouteProvider || !selectedKeyRoute.apiKey)) return writeJson(res, 400, { error: { message: '请先在站点 Key 路由中选择站点和 Key', type: 'api_pet_key_error' } });
+  if (state.routingMode === 'key') {
+    let models;
+    try { models = await modelsForApiKey(keyRouteProvider, selectedKeyRoute.apiKey); }
+    catch (error) { return writeJson(res, 502, { error: { message: `无法获取站点模型列表：${error.message}`, type: 'api_pet_models_error' } }); }
+    if (!models.includes(model)) return writeJson(res, 404, { error: { message: `No provider configured for model: ${model}`, type: 'api_pet_routing_error' } });
+  }
+  const provider = state.routingMode === 'key' ? keyRouteProvider : requestedModel === 'Pet model'
     ? state.providers.find(p => p.id === state.unifiedRoute?.providerId && (state.unifiedRoute.models || providerModels(p)).includes(model))
     : requestedProviderId
     ? state.providers.find(p => p.id === requestedProviderId && providerModels(p).includes(model))
     : findProviderForModel(model);
   if (!provider) return writeJson(res, 404, { error: { message: `No provider configured for model: ${model}`, type: 'api_pet_routing_error' } });
-  const apiKey = requestedModel === 'Pet model' ? unifiedRouteKey(provider) : selectProviderApiKey(provider);
+  const apiKey = state.routingMode === 'key' ? selectedKeyRoute.apiKey : requestedModel === 'Pet model' ? unifiedRouteKey(provider) : selectProviderApiKey(provider);
   if (!apiKey) return writeJson(res, 400, { error: { message: '统一路由所选 Key 无效，请重新选择站点、Key 和模型', type: 'api_pet_key_error' } });
   const requestStartedAt = Date.now();
   recordProviderRequest(provider);
@@ -1029,6 +1079,17 @@ function startGateway() {
     if (!req.url.startsWith('/v1/')) return writeJson(res, 404, { error: 'Use /v1' });
     if (!authOk(req)) return writeJson(res, 401, { error: { message: 'Invalid API Pet key' } });
     if (req.method === 'GET' && req.url === '/v1/models') {
+      if (state.routingMode === 'key') {
+        const route = state.keyRoute;
+        const provider = route && state.providers.find(item => item.id === route.providerId);
+        if (!provider || !route.apiKey) return writeJson(res, 400, { error: { message: '请先在站点 Key 路由中选择站点和 Key' } });
+        try {
+          const models = state.routingEnabled ? await modelsForApiKey(provider, route.apiKey) : [];
+          return writeJson(res, 200, { object: 'list', data: models.map(id => ({ id, object: 'model', owned_by: 'api-pet' })) });
+        } catch (error) {
+          return writeJson(res, 502, { error: { message: `无法获取站点模型列表：${error.message}`, type: 'api_pet_models_error' } });
+        }
+      }
       const models = !state.routingEnabled ? [] : state.routingMode === 'unified' ? [{ id: 'Pet model', object: 'model', owned_by: 'api-pet' }] : allModels();
       return writeJson(res, 200, { object: 'list', data: models });
     }
@@ -1254,9 +1315,10 @@ ipcMain.handle('save-provider', (_e, input) => {
     state.providers[idx] = { ...state.providers[idx], ...record };
   } else state.providers.push(record);
   if (state.unifiedRoute.providerId === record.id) state.unifiedRoute = normalizeUnifiedRoute(state.unifiedRoute);
+  if (state.keyRoute.providerId === record.id) state.keyRoute = normalizeKeyRoute(state.keyRoute);
   persist(); return safeState();
 });
-ipcMain.handle('delete-provider', (_e, id) => { state.providers = state.providers.filter(p => p.id !== id); Object.keys(state.routes).forEach(m => { if (state.routes[m] === id) delete state.routes[m]; }); if (state.unifiedRoute.providerId === id) state.unifiedRoute = { providerId: '', apiKey: '', model: '', models: [] }; persist(); return safeState(); });
+ipcMain.handle('delete-provider', (_e, id) => { state.providers = state.providers.filter(p => p.id !== id); Object.keys(state.routes).forEach(m => { if (state.routes[m] === id) delete state.routes[m]; }); if (state.unifiedRoute.providerId === id) state.unifiedRoute = { providerId: '', apiKey: '', model: '', models: [] }; if (state.keyRoute.providerId === id) state.keyRoute = { providerId: '', apiKey: '', models: [] }; persist(); return safeState(); });
 ipcMain.handle('test-provider', (_e, id) => testProvider(id));
 ipcMain.handle('test-provider-key', async (_e, input = {}) => {
   const apiKey = String(input.apiKey || '').trim();
@@ -1297,7 +1359,20 @@ ipcMain.handle('set-balance-settings', (_e, settings) => {
   persist(); scheduleBalanceRefresh(); return safeState();
 });
 ipcMain.handle('set-route', (_e, { model, providerId }) => { state.routes[model] = providerId; persist(); return safeState(); });
-ipcMain.handle('set-routing-mode', (_e, mode) => { state.routingMode = mode === 'unified' ? 'unified' : 'model'; persist(); return safeState(); });
+ipcMain.handle('set-routing-mode', (_e, mode) => { state.routingMode = ['unified', 'model', 'key'].includes(mode) ? mode : 'model'; persist(); return safeState(); });
+ipcMain.handle('set-key-route', async (_e, route) => {
+  const provider = state.providers.find(item => item.id === String(route?.providerId || ''));
+  const index = route?.keyIndex === '' || route?.keyIndex == null ? -1 : Number(route.keyIndex);
+  const apiKey = Number.isInteger(index) && index >= 0 ? provider?.apiKeys?.[index]?.key || '' : '';
+  const target = { providerId: provider?.id || '', apiKey, models: [] };
+  state.keyRoute = target;
+  persist();
+  if (apiKey && provider) {
+    target.models = await modelsForApiKey(provider, apiKey);
+    if (state.keyRoute === target) persist();
+  }
+  return safeState();
+});
 ipcMain.handle('set-routing-enabled', (_e, enabled) => { state.routingEnabled = enabled === true; persist(); return safeState(); });
 ipcMain.handle('set-unified-route', async (_e, route) => {
   const providerId = String(route?.providerId || '');

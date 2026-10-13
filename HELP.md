@@ -189,8 +189,9 @@ Sub2API、New API 和 AIHub 的账户请求使用系统网络和代理设置，�
 
 | 模式 | 客户端模型名 | 配置方式 |
 | --- | --- | --- |
-| 统一路由（统一模型） | `Pet model` | 在 API Pet 中依次选择上游站点、Key 和模型 |
-| 模型路由 | 真实模型名 | 在模型路由表中指定站点，或使用自动选择 |
+| 固定模型路由 | `Pet model` | 在 API Pet 中依次选择上游站点、Key 和模型 |
+| 按模型路由 | 真实模型名 | 在模型路由表中指定站点，或使用自动选择 |
+| 指定 Key 路由 | 真实模型名 | 使用 API Pet Key，并映射到控制面板选定的站点 Key |
 
 统一路由提供“站点 / Key / 模型”三栏：选择站点后选择该站点已保存的 Key，程序自动获取这个 Key 可用的模型，再选择目标模型。Key 菜单优先显示备注，无备注时显示 Key 编号；模型获取期间暂时禁用三栏选择。
 
@@ -204,14 +205,15 @@ Sub2API、New API 和 AIHub 的账户请求使用系统网络和代理设置，�
 | --- | --- |
 | Base URL | `http://127.0.0.1:8787/v1` |
 | API Key | 控制面板“本地统一 API”中显示的统一 Key |
-| 模型 | 统一模型模式填 `Pet model`；模型路由模式填真实模型名 |
+| 模型 | 统一模型模式填 `Pet model`；模型路由模式和站点 Key 路由模式填真实模型名 |
 | 认证头 | `Authorization: Bearer <本地统一 Key>` |
 
 “本地统一 API”在启用路由后显示，Url、Key 和 Pet模型各有独立复制按钮。本地统一 Key 与上游站点 API Key 不同，请使用对应的 Key。
 
 ### 接口
 
-- `GET /v1/models`：统一模型模式返回 `Pet model`；模型路由模式返回聚合模型列表。
+- `GET /v1/models`：统一模型模式返回 `Pet model`；模型路由模式返回聚合模型列表；站点 Key 路由模式返回控制面板所选 Key 的模型。
+- 站点 Key 路由模式仍使用本地统一 Key。启用后在控制面板选择站点和 Key，API Pet 会把本地 Key 映射为所选站点 Key，并只返回、转发该 Key 实际可访问的模型。
 - `POST /v1/chat/completions`：转发 Chat Completions 请求，支持流式响应透传。
 - `POST /v1/responses`：转发 Responses 请求，支持流式响应透传。
 

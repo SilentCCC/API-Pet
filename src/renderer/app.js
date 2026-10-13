@@ -652,13 +652,37 @@ function updateCompactMoneyColumns() {
 function renderMode() {
   const enabled = appState.routingEnabled === true;
   const unified = appState.routingMode === 'unified';
+  const keyMode = appState.routingMode === 'key';
+  const modeDescriptions = {
+    unified: '客户端使用 `Pet model`，固定转发到控制面板选定的站点、Key 和模型。',
+    model: '客户端使用真实模型名，API Pet 根据模型路由到对应站点。',
+    key: '客户端使用 API Pet Key，API Pet 将请求转换为控制面板选定的站点 Key。'
+  };
   $('routingEnabled').checked = enabled;
-  $('routingMode').value = unified ? 'unified' : 'model';
-  $('unifiedRoute').classList.toggle('hidden', !enabled || !unified);
-  $('routes').classList.toggle('hidden', !enabled || unified);
+  $('routingMode').value = unified ? 'unified' : keyMode ? 'key' : 'model';
+  if ($('routingModeDescription')) $('routingModeDescription').textContent = modeDescriptions[appState.routingMode] || modeDescriptions.model;
+  $('unifiedRoute').classList.toggle('hidden', !enabled || (!unified && !keyMode));
+  $('routes').classList.toggle('hidden', !enabled || unified || keyMode);
   $('routingGateway')?.classList.toggle('hidden', !enabled);
+  $('gatewayKeyField')?.classList.remove('hidden');
+  $('gatewayModelField')?.classList.toggle('hidden', keyMode);
   if (!enabled) return;
-  unified ? renderUnifiedRoute() : renderRoutes();
+  unified ? renderUnifiedRoute() : keyMode ? renderKeyRoute() : renderRoutes();
+}
+function renderKeyRoute() {
+  const route = appState.keyRoute || {};
+  const provider = appState.providers.find(item => item.id === route.providerId);
+  const keys = provider?.apiKeys || [];
+  const keyIndex = keys.findIndex(item => item.key === route.apiKey);
+  const models = keyIndex >= 0 ? [...new Set(route.models || [])].sort() : [];
+  $('unifiedRoute').innerHTML = `<div class="unified-card"><div class="unified-field"><label>站点<select id="keyRouteProvider"><option value="">选择站点</option>${appState.providers.map(item => `<option value="${escapeHtml(item.id)}" ${item.id === route.providerId ? 'selected' : ''}>${escapeHtml(item.name)}</option>`).join('')}</select></label></div><div class="unified-field"><label>Key<select id="keyRouteKey"><option value="">${provider ? '选择 Key' : '先选择站点'}</option>${keys.map((item, index) => `<option value="${index}" ${index === keyIndex ? 'selected' : ''}>${escapeHtml(item.remark || `Key ${index + 1}`)}</option>`).join('')}</select></label></div><div class="unified-caption">客户端仍使用 API Pet 本地 Key，API Pet 会转换为所选站点 Key</div><div class="unified-caption">可用模型：${models.length ? models.map(escapeHtml).join('、') : '暂无可用模型'}</div></div>`;
+  $('keyRouteProvider').onchange = () => saveKeyRoute({ providerId: $('keyRouteProvider').value }, '站点已选择，请选择 Key');
+  $('keyRouteKey').onchange = () => saveKeyRoute({ providerId: route.providerId, keyIndex: $('keyRouteKey').value }, '站点 Key 已保存，模型列表已更新');
+}
+async function saveKeyRoute(input, message) {
+  appState = await window.apiPet.setKeyRoute(input);
+  renderMode();
+  toast(message);
 }
 function renderUnifiedRoute() {
   const route = appState.unifiedRoute || {};
@@ -1651,7 +1675,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   $('refreshAllBalances').onclick = refreshAllProviderBalances;
   $('saveBalanceSettings').onclick = async () => { appState = await window.apiPet.setBalanceSettings({ lowThreshold: $('lowThreshold').value, refreshMinutes: $('refreshMinutes').value }); render(); toast('余额设置已保存'); };
   $('routingEnabled').onchange = async () => { appState = await window.apiPet.setRoutingEnabled($('routingEnabled').checked); renderMode(); toast(appState.routingEnabled ? '已启用模型路由' : '已关闭模型路由'); };
-  $('routingMode').onchange = async () => { appState = await window.apiPet.setRoutingMode($('routingMode').value); renderMode(); toast($('routingMode').value === 'unified' ? '已切换到统一路由模式' : '已切换到模型路由模式'); };
+  $('routingMode').onchange = async () => { const mode = $('routingMode').value; appState = await window.apiPet.setRoutingMode(mode); renderMode(); toast(mode === 'unified' ? '已切换到固定模型路由' : mode === 'key' ? '已切换到指定 Key 路由' : '已切换到按模型路由'); };
   $('balanceAdapter').onchange = () => { currencyDetectionToken += 1; draftCurrencyDetection = 'pending'; updateProviderTypeFields(); detectProviderCurrency(); };
   $('currencyMode').onchange = () => { currencyDetectionToken += 1; updateCurrencyFields(); detectProviderCurrency(); };
   ['loginUrl', 'accountToken', 'accountUserId'].forEach(id => {

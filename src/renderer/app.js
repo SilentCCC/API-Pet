@@ -49,6 +49,7 @@ let currencyDetectionToken = 0;
 let draftDetectedCurrency = '';
 let draftCurrencyDetection = 'pending';
 let unifiedRouteSaving = false;
+let secondaryRouteSaving = false;
 const panel = $('panel');
 const chatPanel = $('chatPanel');
 const dialog = $('providerDialog');
@@ -239,6 +240,34 @@ async function setPanelVisible(visible) {
   if (visible) updateCompactMoneyColumns();
   chatPanel.classList.add('hidden');
   if (!synced) appRoot.classList.toggle('panel-open', visible);
+}
+
+function setSettingsPage(page) {
+  providerDrag?.cancel();
+  for (const name of ['providers', 'routing']) {
+    const selected = name === page;
+    $(`${name}Page`).classList.toggle('hidden', !selected);
+    $(`${name}Tab`).classList.toggle('active', selected);
+    $(`${name}Tab`).setAttribute('aria-selected', String(selected));
+    $(`${name}Tab`).tabIndex = selected ? 0 : -1;
+  }
+  panel.querySelector('.panel-scroll').scrollTop = 0;
+  if (page === 'providers') updateCompactMoneyColumns();
+}
+
+function setupSettingsTabs() {
+  const pages = ['providers', 'routing'];
+  pages.forEach((page, index) => {
+    const tab = $(`${page}Tab`);
+    tab.onclick = () => setSettingsPage(page);
+    tab.onkeydown = event => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const target = event.key === 'Home' ? pages[0] : event.key === 'End' ? pages.at(-1) : pages[1 - index];
+      setSettingsPage(target);
+      $(`${target}Tab`).focus();
+    };
+  });
 }
 
 async function setChatVisible(visible) {
@@ -435,20 +464,6 @@ function updateBalanceRefreshButtons() {
   $('refreshAllProviderBalances').disabled = disabled;
   $('refreshAllBalances').disabled = disabled;
   $('refreshAllProviderBalances').textContent = refreshingAllBalances ? '刷新中…' : '一键刷新余额';
-}
-function moveGatewayIntoRouting() {
-  const routes = $('routes');
-  const routingTitle = [...document.querySelectorAll('.section-title')].find(item => item.querySelector('span')?.textContent.trim() === '路由设置');
-  const gateway = $('localGateway');
-  const controls = $('routingEnabled')?.closest('.routing-controls');
-  if (!routes || !routingTitle || !gateway || !controls) return;
-  let wrapper = $('routingGateway');
-  if (!wrapper) {
-    wrapper = document.createElement('div');
-    wrapper.id = 'routingGateway';
-    controls.after(wrapper);
-  }
-  wrapper.append(gateway);
 }
 async function copyGatewayValue(id, label) {
   try {
@@ -649,10 +664,19 @@ function updateCompactMoneyColumns() {
   list.style.setProperty('--compact-consumption-width', `${moneyColumnWidth('.provider-compact-consumption', 48)}px`);
   list.style.setProperty('--compact-balance-width', `${moneyColumnWidth('.provider-compact-balance', 64)}px`);
 }
-function renderMode() {
-  const enabled = appState.routingEnabled === true;
-  const unified = appState.routingMode === 'unified';
-  const keyMode = appState.routingMode === 'key';
+function routeElement(id, group = 1) { return document.getElementById(id + (group === 2 ? '2' : '')); }
+function routingState(group = 1) {
+  return group === 2 ? appState.secondaryRouting || { routingEnabled: false, routingMode: 'model', routes: {}, unifiedRoute: {}, keyRoute: {} } : appState;
+}
+function routeMarkup(html, group) { return group === 2 ? html.replace(/\bid="([^"]+)"/g, (_match, id) => `id="${id}2"`) : html; }
+function renderMode() { renderRoutingGroup(1); renderRoutingGroup(2); }
+function renderRoutingGroup(group) {
+  const $ = id => routeElement(id, group);
+  const routing = routingState(group);
+  $('unifiedKey').textContent = routing.unifiedKey || '';
+  const enabled = routing.routingEnabled === true;
+  const unified = routing.routingMode === 'unified';
+  const keyMode = routing.routingMode === 'key';
   const modeDescriptions = {
     unified: '客户端使用 `Pet model`，固定转发到控制面板选定的站点、Key 和模型。',
     model: '客户端使用真实模型名，API Pet 根据模型路由到对应站点。',
@@ -660,64 +684,84 @@ function renderMode() {
   };
   $('routingEnabled').checked = enabled;
   $('routingMode').value = unified ? 'unified' : keyMode ? 'key' : 'model';
-  if ($('routingModeDescription')) $('routingModeDescription').textContent = modeDescriptions[appState.routingMode] || modeDescriptions.model;
+  if ($('routingModeDescription')) $('routingModeDescription').textContent = modeDescriptions[routing.routingMode] || modeDescriptions.model;
   $('unifiedRoute').classList.toggle('hidden', !enabled || (!unified && !keyMode));
   $('routes').classList.toggle('hidden', !enabled || unified || keyMode);
   $('routingGateway')?.classList.toggle('hidden', !enabled);
   $('gatewayKeyField')?.classList.remove('hidden');
   $('gatewayModelField')?.classList.toggle('hidden', keyMode);
   if (!enabled) return;
-  unified ? renderUnifiedRoute() : keyMode ? renderKeyRoute() : renderRoutes();
+  unified ? renderUnifiedRoute(group) : keyMode ? renderKeyRoute(group) : renderRoutes(group);
 }
-function renderKeyRoute() {
-  const route = appState.keyRoute || {};
+function renderKeyRoute(group = 1) {
+  const $ = id => routeElement(id, group);
+  const routing = routingState(group);
+  const saving = group === 2 ? secondaryRouteSaving : unifiedRouteSaving;
+  const route = routing.keyRoute || {};
   const provider = appState.providers.find(item => item.id === route.providerId);
   const keys = provider?.apiKeys || [];
   const keyIndex = keys.findIndex(item => item.key === route.apiKey);
   const models = keyIndex >= 0 ? [...new Set(route.models || [])].sort() : [];
-  $('unifiedRoute').innerHTML = `<div class="unified-card"><div class="unified-field"><label>站点<select id="keyRouteProvider"><option value="">选择站点</option>${appState.providers.map(item => `<option value="${escapeHtml(item.id)}" ${item.id === route.providerId ? 'selected' : ''}>${escapeHtml(item.name)}</option>`).join('')}</select></label></div><div class="unified-field"><label>Key<select id="keyRouteKey"><option value="">${provider ? '选择 Key' : '先选择站点'}</option>${keys.map((item, index) => `<option value="${index}" ${index === keyIndex ? 'selected' : ''}>${escapeHtml(item.remark || `Key ${index + 1}`)}</option>`).join('')}</select></label></div><div class="unified-caption">客户端仍使用 API Pet 本地 Key，API Pet 会转换为所选站点 Key</div><div class="unified-caption">可用模型：${models.length ? models.map(escapeHtml).join('、') : '暂无可用模型'}</div></div>`;
-  $('keyRouteProvider').onchange = () => saveKeyRoute({ providerId: $('keyRouteProvider').value }, '站点已选择，请选择 Key');
-  $('keyRouteKey').onchange = () => saveKeyRoute({ providerId: route.providerId, keyIndex: $('keyRouteKey').value }, '站点 Key 已保存，模型列表已更新');
+  $('unifiedRoute').innerHTML = routeMarkup(`<div class="unified-card"><div class="unified-field"><label>站点<select id="keyRouteProvider"><option value="">选择站点</option>${appState.providers.map(item => `<option value="${escapeHtml(item.id)}" ${item.id === route.providerId ? 'selected' : ''}>${escapeHtml(item.name)}</option>`).join('')}</select></label></div><div class="unified-field"><label>Key<select id="keyRouteKey"><option value="">${provider ? '选择 Key' : '先选择站点'}</option>${keys.map((item, index) => `<option value="${index}" ${index === keyIndex ? 'selected' : ''}>${escapeHtml(item.remark || `Key ${index + 1}`)}</option>`).join('')}</select></label></div><div class="unified-caption">客户端仍使用 API Pet 本地 Key，API Pet 会转换为所选站点 Key</div><div class="unified-caption">可用模型：${models.length ? models.map(escapeHtml).join('、') : '暂无可用模型'}</div></div>`, group);
+  $('keyRouteProvider').disabled = saving;
+  $('keyRouteKey').disabled = saving || !provider || !keys.length;
+  $('keyRouteProvider').onchange = () => saveKeyRoute({ providerId: $('keyRouteProvider').value }, '站点已选择，请选择 Key', group);
+  $('keyRouteKey').onchange = () => saveKeyRoute({ providerId: route.providerId, keyIndex: $('keyRouteKey').value }, '站点 Key 已保存，模型列表已更新', group);
 }
-async function saveKeyRoute(input, message) {
-  appState = await window.apiPet.setKeyRoute(input);
-  renderMode();
-  toast(message);
+async function saveKeyRoute(input, message, group = 1) {
+  if (group === 2 ? secondaryRouteSaving : unifiedRouteSaving) return;
+  if (group === 2) secondaryRouteSaving = true; else unifiedRouteSaving = true;
+  renderKeyRoute(group);
+  try {
+    appState = await window.apiPet.setKeyRoute(input, group);
+    toast(message);
+  } catch (error) {
+    try { appState = await window.apiPet.getState(); } catch {}
+    toast(`更新指定 Key 路由失败：${error.message}`);
+  } finally {
+    if (group === 2) secondaryRouteSaving = false; else unifiedRouteSaving = false;
+    renderMode();
+  }
 }
-function renderUnifiedRoute() {
-  const route = appState.unifiedRoute || {};
+function renderUnifiedRoute(group = 1) {
+  const $ = id => routeElement(id, group);
+  const routing = routingState(group);
+  const saving = group === 2 ? secondaryRouteSaving : unifiedRouteSaving;
+  const route = routing.unifiedRoute || {};
   const provider = appState.providers.find(item => item.id === route.providerId);
   const keys = provider?.apiKeys || [];
   const keyIndex = Object.prototype.hasOwnProperty.call(route, 'apiKey')
     ? keys.findIndex(item => item.key === route.apiKey) : keys.findIndex(item => item.enabled !== false);
   const models = keyIndex >= 0 ? [...new Set(route.models || provider?.models || [])].sort() : [];
-  $('unifiedRoute').innerHTML = `<div class="unified-card"><div class="unified-field"><label>站点<select id="unifiedProvider"><option value="">选择站点</option>${appState.providers.map(item => `<option value="${escapeHtml(item.id)}" ${item.id === route.providerId ? 'selected' : ''}>${escapeHtml(item.name)}</option>`).join('')}</select></label></div><div class="unified-field"><label>Key<select id="unifiedKeySelect"><option value="">${provider ? '选择 Key' : '先选择站点'}</option>${keys.map((item, index) => `<option value="${index}" ${index === keyIndex ? 'selected' : ''}>${escapeHtml(item.remark || `Key ${index + 1}`)}</option>`).join('')}</select></label></div><div class="unified-field"><label>模型<select id="unifiedTargetModel"><option value="">${unifiedRouteSaving ? '正在更新…' : keyIndex < 0 ? '先选择 Key' : models.length ? '选择模型' : '暂无可用模型'}</option>${models.map(model => `<option value="${escapeHtml(model)}" ${model === route.model ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('')}</select></label></div><div class="unified-caption">客户端模型为 <b>Pet model</b></div></div>`;
-  $('unifiedProvider').disabled = unifiedRouteSaving;
-  $('unifiedKeySelect').disabled = unifiedRouteSaving || !provider || !keys.length;
-  $('unifiedTargetModel').disabled = unifiedRouteSaving || !models.length;
-  $('unifiedProvider').onchange = () => saveUnifiedRoute({ providerId: $('unifiedProvider').value }, '站点已选择，请选择 Key');
-  $('unifiedKeySelect').onchange = () => saveUnifiedRoute({ providerId: route.providerId, keyIndex: $('unifiedKeySelect').value }, 'Key 已选择，模型列表已更新');
-  $('unifiedTargetModel').onchange = () => saveUnifiedRoute({ providerId: route.providerId, model: $('unifiedTargetModel').value }, '统一模型已保存');
+  $('unifiedRoute').innerHTML = routeMarkup(`<div class="unified-card"><div class="unified-field"><label>站点<select id="unifiedProvider"><option value="">选择站点</option>${appState.providers.map(item => `<option value="${escapeHtml(item.id)}" ${item.id === route.providerId ? 'selected' : ''}>${escapeHtml(item.name)}</option>`).join('')}</select></label></div><div class="unified-field"><label>Key<select id="unifiedKeySelect"><option value="">${provider ? '选择 Key' : '先选择站点'}</option>${keys.map((item, index) => `<option value="${index}" ${index === keyIndex ? 'selected' : ''}>${escapeHtml(item.remark || `Key ${index + 1}`)}</option>`).join('')}</select></label></div><div class="unified-field"><label>模型<select id="unifiedTargetModel"><option value="">${saving ? '正在更新…' : keyIndex < 0 ? '先选择 Key' : models.length ? '选择模型' : '暂无可用模型'}</option>${models.map(model => `<option value="${escapeHtml(model)}" ${model === route.model ? 'selected' : ''}>${escapeHtml(model)}</option>`).join('')}</select></label></div><div class="unified-caption">客户端模型为 <b>Pet model</b></div></div>`, group);
+  $('unifiedProvider').disabled = saving;
+  $('unifiedKeySelect').disabled = saving || !provider || !keys.length;
+  $('unifiedTargetModel').disabled = saving || !models.length;
+  $('unifiedProvider').onchange = () => saveUnifiedRoute({ providerId: $('unifiedProvider').value }, '站点已选择，请选择 Key', group);
+  $('unifiedKeySelect').onchange = () => saveUnifiedRoute({ providerId: route.providerId, keyIndex: $('unifiedKeySelect').value }, 'Key 已选择，模型列表已更新', group);
+  $('unifiedTargetModel').onchange = () => saveUnifiedRoute({ providerId: route.providerId, model: $('unifiedTargetModel').value }, '固定模型已保存', group);
 }
-async function saveUnifiedRoute(input, message) {
-  if (unifiedRouteSaving) return;
-  unifiedRouteSaving = true;
-  renderUnifiedRoute();
+async function saveUnifiedRoute(input, message, group = 1) {
+  if (group === 2 ? secondaryRouteSaving : unifiedRouteSaving) return;
+  if (group === 2) secondaryRouteSaving = true; else unifiedRouteSaving = true;
+  renderUnifiedRoute(group);
   try {
-    appState = await window.apiPet.setUnifiedRoute(input);
+    appState = await window.apiPet.setUnifiedRoute(input, group);
     toast(message);
   } catch (error) {
     try { appState = await window.apiPet.getState(); } catch {}
-    toast(`更新统一路由失败：${error.message}`);
+    toast(`更新固定模型路由失败：${error.message}`);
   } finally {
-    unifiedRouteSaving = false;
+    if (group === 2) secondaryRouteSaving = false; else unifiedRouteSaving = false;
     renderMode();
   }
 }
-function renderRoutes() {
+function renderRoutes(group = 1) {
+  const $ = id => routeElement(id, group);
+  const routing = routingState(group);
   const models = [...new Set(appState.providers.flatMap(provider => provider.models || []))].sort();
-  $('routes').innerHTML = models.length ? models.map(model => { const selected = appState.routes[model] || ''; const options = appState.providers.filter(provider => (provider.models || []).includes(model)).map(provider => `<option value="${provider.id}" ${selected === provider.id ? 'selected' : ''}>${escapeHtml(provider.name)}</option>`).join(''); return `<div class="route-row"><b>${escapeHtml(model)}</b><select data-model="${escapeHtml(model)}"><option value="">自动选择</option>${options}</select></div>`; }).join('') : '<div style="font-size:11px;color:#a88b98;padding:8px 0">测试 Provider 后会在这里显示模型路由</div>';
-  $('routes').querySelectorAll('select').forEach(select => { select.onchange = async () => { appState = await window.apiPet.setRoute({ model: select.dataset.model, providerId: select.value }); toast('路由已保存'); }; });
+  $('routes').innerHTML = models.length ? models.map(model => { const selected = routing.routes[model] || ''; const options = appState.providers.filter(provider => (provider.models || []).includes(model)).map(provider => `<option value="${provider.id}" ${selected === provider.id ? 'selected' : ''}>${escapeHtml(provider.name)}</option>`).join(''); return `<div class="route-row"><b>${escapeHtml(model)}</b><select data-model="${escapeHtml(model)}"><option value="">自动选择</option>${options}</select></div>`; }).join('') : '<div style="font-size:11px;color:#a88b98;padding:8px 0">测试 Provider 后会在这里显示模型路由</div>';
+  $('routes').querySelectorAll('select').forEach(select => { select.onchange = async () => { appState = await window.apiPet.setRoute({ model: select.dataset.model, providerId: select.value }, group); toast('路由已保存'); }; });
 }
 function fillProviderDialog(provider = {}) {
   ensureTokenRemarkField();
@@ -988,7 +1032,7 @@ async function connectProviderAccount(id, loginUrl = '', { silent = false, useDr
       updateCurrencyFields();
     }
     render();
-    if (!silent) toast(result.ok ? '账户已连接，余额和今日统计已更新' : `连接失败：${result.error}`);
+    if (!silent) toast(result.ok ? result.openedOnly ? '已在内置浏览器打开站点' : '账户已连接，余额和今日统计已更新' : `连接失败：${result.error}`);
     return result;
   } finally {
     connectingAccounts = Math.max(0, connectingAccounts - 1);
@@ -1631,12 +1675,12 @@ window.addEventListener('DOMContentLoaded', async () => {
   ensureChatTargetMenu();
   setupPanelHeightResize();
   setupPanelWidthResize();
+  setupSettingsTabs();
   window.apiPet.onBalanceActivity(setBalanceActivity);
   appState = await window.apiPet.getState();
   setBalanceActivity(await window.apiPet.getBalanceActivity());
   updatePetAnimation();
   ensureProviderToggle();
-  moveGatewayIntoRouting();
   render();
   $('openChat').onclick = () => setChatVisible(chatPanel.classList.contains('hidden'));
   $('openSettings').onclick = () => setPanelVisible(panel.classList.contains('hidden'));
@@ -1670,12 +1714,22 @@ window.addEventListener('DOMContentLoaded', async () => {
   };
   $('quit').onclick = () => window.apiPet.quit();
   $('copyUrl').onclick = () => copyGatewayValue('unifiedUrl', 'URL');
-  $('copyKey').onclick = () => copyGatewayValue('unifiedKey', '统一 Key');
-  $('copyModel').onclick = () => copyGatewayValue('unifiedModel', 'Pet 模型');
   $('refreshAllBalances').onclick = refreshAllProviderBalances;
   $('saveBalanceSettings').onclick = async () => { appState = await window.apiPet.setBalanceSettings({ lowThreshold: $('lowThreshold').value, refreshMinutes: $('refreshMinutes').value }); render(); toast('余额设置已保存'); };
-  $('routingEnabled').onchange = async () => { appState = await window.apiPet.setRoutingEnabled($('routingEnabled').checked); renderMode(); toast(appState.routingEnabled ? '已启用模型路由' : '已关闭模型路由'); };
-  $('routingMode').onchange = async () => { const mode = $('routingMode').value; appState = await window.apiPet.setRoutingMode(mode); renderMode(); toast(mode === 'unified' ? '已切换到固定模型路由' : mode === 'key' ? '已切换到指定 Key 路由' : '已切换到按模型路由'); };
+  for (const group of [1, 2]) {
+    routeElement('copyKey', group).onclick = () => copyGatewayValue('unifiedKey' + (group === 2 ? '2' : ''), `路由设置${group} Key`);
+    routeElement('copyModel', group).onclick = () => copyGatewayValue('unifiedModel' + (group === 2 ? '2' : ''), 'Pet 模型');
+    routeElement('routingEnabled', group).onchange = async () => {
+      appState = await window.apiPet.setRoutingEnabled(routeElement('routingEnabled', group).checked, group);
+      renderMode();
+      toast(`路由设置${group}${routingState(group).routingEnabled ? '已启用' : '已关闭'}`);
+    };
+    routeElement('routingMode', group).onchange = async () => {
+      appState = await window.apiPet.setRoutingMode(routeElement('routingMode', group).value, group);
+      renderMode();
+      toast(`路由设置${group}已切换到${routeElement('routingMode', group).selectedOptions[0].textContent}`);
+    };
+  }
   $('balanceAdapter').onchange = () => { currencyDetectionToken += 1; draftCurrencyDetection = 'pending'; updateProviderTypeFields(); detectProviderCurrency(); };
   $('currencyMode').onchange = () => { currencyDetectionToken += 1; updateCurrencyFields(); detectProviderCurrency(); };
   ['loginUrl', 'accountToken', 'accountUserId'].forEach(id => {

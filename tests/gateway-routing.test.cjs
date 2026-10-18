@@ -30,7 +30,7 @@ async function gateway(t, options = {}) {
       return options.response?.() || Response.json({ output_text: 'test reply' });
     }
   });
-  ['unifiedRouteKey', 'resolveRequestedModel', 'findProviderForModel', 'allModels', 'gatewayCredential', 'authOk', 'writeJson', 'proxyChat', 'startGateway'].forEach(name => include(context, name));
+  ['unifiedRouteKey', 'resolveRequestedModel', 'findProviderForModel', 'allModels', 'modelsForApiKey', 'gatewayCredential', 'gatewayRouting', 'authOk', 'writeJson', 'proxyChat', 'startGateway'].forEach(name => include(context, name));
   context.startGateway();
   const server = context.gateway;
   t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
@@ -123,7 +123,7 @@ test('site Key route maps the local API Pet Key to the selected site Key', async
     recordProviderRequest() {}, recordProviderResult() {}, persist() {}, extractUsage: () => ({}),
     fetch: async (url, request) => { calls.push({ url, headers: request.headers, body: JSON.parse(request.body) }); return Response.json({ output_text: 'ok' }); }
   });
-  ['cleanBaseUrl', 'providerModels', 'providerBaseUrls', 'selectProviderApiKey', 'modelsForApiKey', 'gatewayCredential', 'unifiedRouteKey', 'resolveRequestedModel', 'findProviderForModel', 'allModels', 'authOk', 'writeJson', 'proxyChat', 'startGateway'].forEach(name => include(context, name));
+  ['cleanBaseUrl', 'providerModels', 'providerBaseUrls', 'selectProviderApiKey', 'modelsForApiKey', 'gatewayCredential', 'gatewayRouting', 'unifiedRouteKey', 'resolveRequestedModel', 'findProviderForModel', 'allModels', 'authOk', 'writeJson', 'proxyChat', 'startGateway'].forEach(name => include(context, name));
   context.startGateway();
   const server = context.gateway;
   t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
@@ -249,4 +249,111 @@ test('default Key model tests update only the matching unified Key list', async 
   state.unifiedRoute={providerId:'test',apiKey:'second',model:'second-model',models:['second-model']};
   resolveModels(['first-model']); await request;
   assert.deepEqual(Array.from(state.unifiedRoute.models),['second-model'],'Default Key changed while model request was pending');
+});
+
+
+for (const firstMode of ['unified', 'model', 'key']) {
+  for (const secondMode of ['unified', 'model', 'key']) {
+    test(`two local Keys isolate simultaneous ${firstMode}/${secondMode} routes`, async t => {
+      const providers = ['a', 'b'].map(id => ({ id, models: ['shared-model'], apiKey: `${id}-default`,
+        apiKeys: [{ key: `${id}-default`, enabled: true }, { key: `${id}-selected`, enabled: false }],
+        apiKeyModels: { [`${id}-selected`]: [`${id}-only-model`] }, requestUrl: `https://${id}.test/v1` }));
+      const config = (id, mode) => ({ unifiedKey: `pet-${id}`, routingEnabled: true, routingMode: mode,
+        routes: { 'shared-model': id }, unifiedRoute: { providerId: id, apiKey: `${id}-selected`, model: 'shared-model', models: ['shared-model'] },
+        keyRoute: { providerId: id, apiKey: `${id}-selected`, models: [`${id}-only-model`] } });
+      const { state, base, send, calls } = await gateway(t, { state: { ...config('a', firstMode), secondaryRouting: config('b', secondMode), providers },
+        response: () => new Response('data: {"text":"ok"}\n\ndata: [DONE]\n\n', { headers: { 'Content-Type': 'text/event-stream' } }) });
+      const requestModel = (id, mode) => mode === 'unified' ? 'Pet model' : mode === 'key' ? `${id}-only-model` : 'shared-model';
+      for (const endpoint of ['/responses', '/chat/completions']) {
+        const responses = await Promise.all([send(endpoint, { model: requestModel('a', firstMode), stream: true, marker: 'a' }, 'pet-a'),
+          send(endpoint, { model: requestModel('b', secondMode), stream: true, marker: 'b' }, 'pet-b')]);
+        for (const response of responses) {
+          assert.equal(response.status, 200, await response.clone().text());
+          assert.match(response.headers.get('content-type'), /event-stream/);
+          assert.match(await response.text(), /\[DONE\]/);
+        }
+      }
+      for (const call of calls) {
+        const id = call.body.marker;
+        const mode = id === 'a' ? firstMode : secondMode;
+        assert.match(call.url, new RegExp(`https://${id}\\.test/v1/`));
+        assert.equal(call.headers.Authorization, `Bearer ${id}-${mode === 'model' ? 'default' : 'selected'}`);
+        assert.equal(call.body.model, mode === 'key' ? `${id}-only-model` : 'shared-model');
+      }
+      const list = async key => {
+        const response = await fetch(base + '/models', { headers: { 'x-api-key': key } });
+        assert.equal(response.status, 200);
+        return (await response.json()).data.map(item => item.id);
+      };
+      assert.deepEqual(await list('pet-a'), [firstMode === 'unified' ? 'Pet model' : firstMode === 'model' ? 'shared-model' : 'a-only-model']);
+      assert.deepEqual(await list('pet-b'), [secondMode === 'unified' ? 'Pet model' : secondMode === 'model' ? 'shared-model' : 'b-only-model']);
+      for (const [disabled, active] of [[state, state.secondaryRouting], [state.secondaryRouting, state]]) {
+        disabled.routingEnabled = false;
+        assert.deepEqual(await list(disabled.unifiedKey), []);
+        assert.equal((await send('/responses', { model: requestModel(disabled === state ? 'a' : 'b', disabled.routingMode) }, disabled.unifiedKey)).status, 400);
+        const response = await send('/responses', { model: requestModel(active === state ? 'a' : 'b', active.routingMode) }, active.unifiedKey);
+        assert.equal(response.status, 200);
+        await response.text();
+        disabled.routingEnabled = true;
+      }
+      assert.equal((await send('/responses', { model: 'shared-model' }, 'wrong-key')).status, 401);
+    });
+  }
+}
+
+test('second route configuration persists without changing the original Key and selections', () => {
+  const provider = { id: 'site', models: ['model'], apiKeys: [{ key: 'upstream', enabled: true }] };
+  const saved = { unifiedKey: 'pet-existing', routingEnabled: true, routingMode: 'unified', routes: { model: 'site' },
+    unifiedRoute: { providerId: 'site', apiKey: 'upstream', model: 'model', models: ['model'] }, providers: [provider] };
+  const context = vm.createContext({ crypto, fs: { readFileSync: () => JSON.stringify(saved) }, dataPath: () => 'test', normalizeProvider: item => item });
+  ['defaultState', 'providerModels', 'selectProviderApiKey', 'unifiedRouteKey', 'normalizeUnifiedRoute', 'normalizeKeyRoute', 'loadState'].forEach(name => include(context, name));
+  const migrated = context.loadState();
+  assert.equal(migrated.unifiedKey, saved.unifiedKey);
+  assert.equal(migrated.routingEnabled, true);
+  assert.equal(migrated.unifiedRoute.model, 'model');
+  assert.notEqual(migrated.secondaryRouting.unifiedKey, saved.unifiedKey);
+  assert.match(migrated.secondaryRouting.unifiedKey, /^pet-/);
+  assert.equal(migrated.secondaryRouting.routingEnabled, false);
+  saved.secondaryRouting = JSON.parse(JSON.stringify(migrated.secondaryRouting));
+  saved.secondaryRouting.routingEnabled = true;
+  saved.secondaryRouting.routingMode = 'key';
+  saved.secondaryRouting.keyRoute = { providerId: 'site', apiKey: 'upstream', models: ['model'] };
+  const loaded = context.loadState();
+  assert.equal(loaded.secondaryRouting.unifiedKey, saved.secondaryRouting.unifiedKey);
+  assert.equal(loaded.secondaryRouting.keyRoute.apiKey, 'upstream');
+  saved.providers[0].apiKeys = [];
+  assert.equal(context.loadState().secondaryRouting.keyRoute.apiKey, '');
+});
+
+test('IPC selections, mode switches and pending model fetches stay within their route group', async () => {
+  const handlers = {};
+  const state = { providers: [{ id: 'site', models: ['a', 'b'], apiKeys: [{ key: 'a' }, { key: 'b' }] }],
+    routes: {}, unifiedRoute: {}, keyRoute: {}, secondaryRouting: { routes: {}, unifiedRoute: {}, keyRoute: {} } };
+  const pending = [];
+  const context = vm.createContext({ state, ipcMain: { handle: (name, fn) => { handlers[name] = fn; } }, persist() {}, safeState: () => state,
+    providerModels: provider => provider.models, fetchModels: (_provider, key) => new Promise(resolve => pending.push({ key, resolve })),
+    modelsForApiKey: async (_provider, key) => [key + '-only'] });
+  include(context, 'unifiedRouteKey');
+  vm.runInContext(source.slice(source.indexOf("ipcMain.handle('set-route'"), source.indexOf("ipcMain.handle('quit'")), context);
+  handlers['set-routing-mode'](null, 'unified', 1);
+  handlers['set-routing-mode'](null, 'key', 2);
+  handlers['set-routing-enabled'](null, true, 2);
+  assert.equal(state.routingMode, 'unified');
+  assert.equal(state.secondaryRouting.routingMode, 'key');
+  assert.equal(state.routingEnabled, undefined);
+  handlers['set-route'](null, { model: 'same', providerId: 'a' }, 1);
+  handlers['set-route'](null, { model: 'same', providerId: 'b' }, 2);
+  assert.equal(state.routes.same, 'a');
+  assert.equal(state.secondaryRouting.routes.same, 'b');
+  const first = handlers['set-unified-route'](null, { providerId: 'site', keyIndex: 0 }, 1);
+  const second = handlers['set-unified-route'](null, { providerId: 'site', keyIndex: 1 }, 2);
+  pending[1].resolve(['b']); await second;
+  pending[0].resolve(['a']); await first;
+  handlers['set-unified-route'](null, { providerId: 'site', model: 'a' }, 1);
+  handlers['set-unified-route'](null, { providerId: 'site', model: 'b' }, 2);
+  assert.equal(state.unifiedRoute.model, 'a');
+  assert.equal(state.secondaryRouting.unifiedRoute.model, 'b');
+  await handlers['set-key-route'](null, { providerId: 'site', keyIndex: 1 }, 2);
+  assert.equal(state.secondaryRouting.keyRoute.apiKey, 'b');
+  assert.equal(state.keyRoute.apiKey, undefined);
 });

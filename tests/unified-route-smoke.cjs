@@ -56,6 +56,7 @@ async function run() {
   const waitFor=condition=>execute(`(async()=>{for(let i=0;i<100;i++){if(${condition})return;await new Promise(r=>setTimeout(r,20));}throw new Error(${JSON.stringify(condition)});})()`);
   await waitFor(`$('unifiedProvider')`);
   await execute(`$('openSettings').click()`);
+  await execute(`$('routingTab').click()`);
   assert.deepEqual(await execute(`Array.from(document.querySelectorAll('.unified-field label'),el=>el.firstChild.textContent)`),['站点','Key','模型']);
   assert.equal(await execute(`$('unifiedKeySelect').disabled && $('unifiedTargetModel').disabled`),true);
   await execute(`$('unifiedProvider').value='first'; $('unifiedProvider').onchange()`);

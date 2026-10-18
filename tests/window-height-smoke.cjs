@@ -166,7 +166,7 @@ async function run() {
   await checkColumns();
   fs.writeFileSync(path.join(output, 'panel-width.png'), (await window.webContents.capturePage()).toPNG());
   assert.equal(await execute(`getComputedStyle($('routingGateway')).display`), 'none');
-  await execute(`appState.routingEnabled = true; appState.routingMode = 'unified';
+  await execute(`$('routingTab').click(); appState.routingEnabled = true; appState.routingMode = 'unified';
     appState.providers.find(p => p.id === 'saved').apiKeys = [{key:'route-test-key',remark:'默认 Key',enabled:true}];
     appState.unifiedRoute = {providerId:'saved', apiKey:'route-test-key', model:'a', models:['a']}; render();
     $('unifiedRoute').scrollIntoView({block:'center'});`);
@@ -187,7 +187,7 @@ async function run() {
       window.gatewayCopies.push(text);
     }}});`);
   assert.equal(await execute(`$('localGateway').querySelector('.section-title').textContent`), '本地统一 API');
-  assert.equal(await execute(`$('localGateway').querySelectorAll('.gateway-field').length`), 3);
+  assert.equal(await execute(`$('localGateway').querySelectorAll('.gateway-field').length`), 1);
   await execute(`$('copyUrl').click(); $('copyKey').click(); $('copyModel').click();`);
   await waitLayout();
   assert.deepEqual(await execute(`window.gatewayCopies`), ['http://127.0.0.1:8787/v1', 'pet-test-only-0123456789abcdef0123456789abcdef', 'Pet model']);

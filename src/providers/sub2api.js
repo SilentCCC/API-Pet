@@ -47,6 +47,21 @@ function apiUrl(provider, pathname) {
   }
 }
 
+function usageStatsUrl(provider) {
+  const url = new URL(apiUrl(provider, 'usage/stats'));
+  const now = Date.now();
+  const formatDate = date => {
+    const parts = new Intl.DateTimeFormat('en-US', { year: 'numeric', month: '2-digit', day: '2-digit' }).formatToParts(date);
+    const value = type => parts.find(part => part.type === type).value;
+    return `${value('year')}-${value('month')}-${value('day')}`;
+  };
+  // Match the usage page's "last 24 hours" date filter and local timezone.
+  url.searchParams.set('start_date', formatDate(new Date(now - 86400000)));
+  url.searchParams.set('end_date', formatDate(new Date(now)));
+  url.searchParams.set('timezone', Intl.DateTimeFormat().resolvedOptions().timeZone);
+  return url;
+}
+
 function requestContext(provider) {
   const context = {
     provider,
@@ -212,7 +227,6 @@ module.exports = {
     const refreshToken = String(provider.accountRefreshToken || '').trim();
     if (!token && !cookie && !refreshToken) return notConfigured('Sub2API', '点击“连接账户”完成网页授权');
     const profileUrl = apiUrl(provider, 'user/profile');
-    const statsUrl = apiUrl(provider, 'usage/dashboard/stats');
     const usageUrl = apiUrl(provider, 'usage');
     if (!profileUrl) throw new Error('Sub2API 登录地址无效');
     const controller = new AbortController();
@@ -222,7 +236,7 @@ module.exports = {
       const [profile, stats, usage] = await Promise.all([
         provider._accountProfile || getProfile(provider, context, controller.signal),
         // Statistics are supplementary; a missing dashboard must not hide balance.
-        getJson(statsUrl, context, controller.signal).catch(() => null),
+        getJson(usageStatsUrl(provider), context, controller.signal).catch(() => null),
         // The dashboard rate is an aggregate. The displayed rate is the arithmetic
         // mean of per-record rates from the most recent twenty usage records.
         (async () => {
@@ -241,10 +255,11 @@ module.exports = {
       const user = profile?.user ?? profile;
       const balance = parseNumber(user?.balance);
       if (balance == null) throw new Error('Sub2API /user/profile 响应中没有可识别的 balance 字段');
-      const todayCost = parseNumber(stats?.today_actual_cost);
-      const todayRequests = parseNumber(stats?.today_requests);
-      const inputTokens = firstNumber(stats, ['today_input_tokens', 'todayInputTokens', 'input_tokens', 'inputTokens', 'prompt_tokens', 'promptTokens']);
-      const cacheTokens = firstNumber(stats, ['today_cache_read_tokens', 'todayCacheReadTokens', 'cache_read_tokens', 'cacheReadTokens', 'today_cached_tokens', 'todayCachedTokens', 'cached_tokens', 'cachedTokens', 'cache_tokens', 'cacheTokens']);
+      // Preserve stored field names while displaying the usage page's selected range.
+      const todayCost = parseNumber(stats?.total_actual_cost);
+      const todayRequests = parseNumber(stats?.total_requests);
+      const inputTokens = firstNumber(stats, ['total_input_tokens', 'input_tokens', 'inputTokens', 'prompt_tokens', 'promptTokens']);
+      const cacheTokens = firstNumber(stats, ['total_cache_read_tokens', 'cache_read_tokens', 'cacheReadTokens', 'cached_tokens', 'cachedTokens', 'cache_tokens', 'cacheTokens']);
       const cacheHitRate24h = cacheHitRate(inputTokens, cacheTokens);
       const cacheHitRateRecent20 = recentCacheHitRate(usage);
       return {
@@ -253,7 +268,7 @@ module.exports = {
         ...(stats || usage ? { accountStats: {
           todayCost,
           todayRequests,
-          todayTokens: parseNumber(stats?.today_tokens),
+          todayTokens: parseNumber(stats?.total_tokens),
           inputTokens,
           cacheTokens,
           cacheHitRate24h,

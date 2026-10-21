@@ -123,6 +123,19 @@ async function run() {
     assert.deepEqual(result, {overflow:false, overlaps:false, aligned:true, fitsWindow:true, moneyVisible:true});
   };
   await execute(`appState.providers = [
+    {id:'newapi',name:'New API',balanceAdapter:'new-api',accountStats:{todayCost:0.6074,todayRequests:112,todayTokens:7914389}},
+    {id:'subapi',name:'SubAPI',balanceAdapter:'sub2api',accountStats:{todayCost:1.3118,todayRequests:73,todayTokens:4910000}},
+    {id:'aihub',name:'AIHub',balanceAdapter:'aihub',accountStats:{todayCost:1,todayRequests:2,todayTokens:3}}
+  ]; providersCollapsed=false; render();`);
+  const usageText = await execute(`Array.from(document.querySelectorAll('.provider-stats'),card=>card.textContent)`);
+  assert.ok(usageText[0].includes('24小时 Token：7,914,389') && usageText[0].includes('24小时请求：112 次') && usageText[0].includes('24小时消耗：$0.6074'));
+  assert.ok(!usageText[0].includes('今日'));
+  assert.ok(usageText[1].includes('24小时 Token：4,910,000') && usageText[1].includes('24小时请求：73 次') && usageText[1].includes('24小时消耗：$1.3118'));
+  assert.ok(!usageText[1].includes('今日'));
+  assert.ok(usageText[2].includes('今日 Token：3') && usageText[2].includes('今日请求：2 次') && usageText[2].includes('今日消耗：$1.0000'));
+  await execute(`appState.providers[0].accountStats={}; appState.providers[0].dailyStats={requestCount:12,cost:5}; render();`);
+  assert.ok(await execute(`document.querySelector('.provider-stats').textContent.includes('24小时请求：-- 次') && document.querySelector('.provider-stats').textContent.includes('24小时消耗：--')`));
+  await execute(`appState.providers = [
     {id:'saved', name:'仅保存站点', balanceAdapter:'none', models:['a','b','c'], status:'online'},
     {id:'normal', name:'普通站点', balance:{balance:42.12346}, dailyStats:{cost:1.23456}, models:[], status:'unknown'},
     {id:'long', name:'很长的站点名称测试', balance:{balance:12345.6789}, models:[], status:'error'}

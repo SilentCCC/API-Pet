@@ -5,11 +5,11 @@ const vm = require('node:vm');
 const { createRequire } = require('node:module');
 const { test } = require('node:test');
 
-function loadAdapter(fetch) {
+function loadAdapter(fetch, globals = {}) {
   const source = fs.readFileSync(path.join(__dirname, '../src/providers/sub2api.js'), 'utf8');
   const adapterRequire = createRequire(path.join(__dirname, '../src/providers/sub2api.js'));
   const context = vm.createContext({ module: { exports: {} }, require: name => name === './base'
-    ? { ...adapterRequire(name), accountFetch: fetch } : adapterRequire(name), URL, AbortController, setTimeout, clearTimeout });
+    ? { ...adapterRequire(name), accountFetch: fetch } : adapterRequire(name), URL, AbortController, setTimeout, clearTimeout, ...globals });
   vm.runInContext(source, context);
   return context.module.exports;
 }
@@ -77,7 +77,7 @@ test('concurrent profile and balance statistics share one refresh request', asyn
     }
     return json({ code: 0, data: String(url).endsWith('/user/profile')
       ? { balance: 0.78 }
-      : { today_actual_cost: 0.01, today_requests: 3 } });
+      : { total_actual_cost: 0.01, total_requests: 3 } });
   });
   const balance = await adapter.getBalance(record);
   assert.equal(balance.balance, 0.78);
@@ -110,7 +110,7 @@ test('overlapping balance queries and imports share refresh token rotation', asy
     return json({ code: 0, data: String(url).includes('/keys?')
       ? { total: 1, items: [{ key: 'sk-test', name: 'test' }] }
       : String(url).endsWith('/user/profile') ? { balance: 0.78 }
-        : { today_actual_cost: 0.01, today_requests: 3 } });
+        : { total_actual_cost: 0.01, total_requests: 3 } });
   });
   const [balance, keys] = await Promise.all([adapter.getBalance(record), adapter.getApiKeys(record)]);
   assert.equal(balance.balance, 0.78);
@@ -149,7 +149,7 @@ test('account profile falls back to auth/me and retains the returned balance and
       { input_tokens: 197, cache_read_tokens: 3328 },
       { input_tokens: 100, cache_read_tokens: 100 }
     ] } });
-    return json({ code: 0, data: { today_actual_cost: '0.0001', today_requests: 2, today_input_tokens: 197, today_cache_read_tokens: 3328 } });
+    return json({ code: 0, data: { total_actual_cost: '0.0001', total_requests: 2, total_input_tokens: 197, total_cache_read_tokens: 3328 } });
   });
   const detection = await adapter.detect(record);
   const result = await adapter.getBalance({ ...record, _accountProfile: detection.profile });
@@ -161,7 +161,41 @@ test('account profile falls back to auth/me and retains the returned balance and
   assert.equal(result.accountStats.cacheHitRate24h, 3328 / (197 + 3328));
   assert.equal(result.accountStats.cacheHitRateRecent20, ((3328 / (197 + 3328)) + (100 / (100 + 100))) / 2);
   assert.equal(result.accountStats.cacheHitRate, ((3328 / (197 + 3328)) + (100 / (100 + 100))) / 2);
-  assert.deepEqual(calls, ['/api/v1/user/profile', '/api/v1/auth/me', '/api/v1/usage/dashboard/stats', '/api/v1/usage']);
+  assert.deepEqual(calls, ['/api/v1/user/profile', '/api/v1/auth/me', '/api/v1/usage/stats', '/api/v1/usage']);
+});
+
+test('Sub2API reads the usage page range totals, including image requests and actual cost', async () => {
+  const now = Date.parse('2026-10-22T00:09:00+08:00');
+  class Clock extends Date { static now() { return now; } }
+  const dateFormat = function(locale, options) { return new Intl.DateTimeFormat(locale, { ...options, timeZone: 'Asia/Shanghai' }); };
+  const calls = [];
+  const adapter = loadAdapter(async url => {
+    const request = new URL(url);
+    calls.push(request);
+    if (request.pathname.endsWith('/user/profile')) return json({ code:0, data:{balance:1.29} });
+    if (request.pathname === '/api/v1/usage/stats') return json({ code:0, data:{
+      total_requests:73, total_tokens:4910000, total_actual_cost:1.3118, total_cost:10.8025,
+      total_input_tokens:1190000, total_cache_read_tokens:3690000, average_duration_ms:36880,
+      today_requests:1, today_tokens:10, today_actual_cost:0.01
+    } });
+    assert.equal(request.pathname, '/api/v1/usage');
+    return json({code:0,data:{items:[{input_tokens:197,cache_read_tokens:3328}]}});
+  }, { Date:Clock, Intl:{DateTimeFormat:dateFormat} });
+  const result = await adapter.getBalance(provider());
+  assert.equal(result.accountStats.todayRequests,73);
+  assert.equal(result.accountStats.todayTokens,4910000);
+  assert.equal(result.accountStats.todayCost,1.3118, 'Uses actual cost rather than standard price');
+  assert.equal(result.accountStats.averageDurationMs,36880);
+  assert.equal(result.accountStats.cacheHitRate24h,3690000/(1190000+3690000));
+  assert.equal(result.accountStats.cacheHitRateRecent20,3328/(197+3328));
+  const stats = calls.find(request=>request.pathname==='/api/v1/usage/stats');
+  assert.equal(stats.searchParams.get('start_date'),'2026-10-21');
+  assert.equal(stats.searchParams.get('end_date'),'2026-10-22');
+  assert.equal(stats.searchParams.get('timezone'),'Asia/Shanghai');
+  assert.equal(calls.length,3, 'No extra request to the today dashboard');
+  const recent = calls.find(request=>request.pathname==='/api/v1/usage');
+  assert.equal(recent.searchParams.get('page_size'),'20');
+  assert.equal(recent.searchParams.get('sort_order'),'desc');
 });
 
 test('cache hit rate averages valid recent records and skips invalid records', async () => {
@@ -207,7 +241,7 @@ test('auth/me supplies balance when user/profile contains no balance field', asy
 });
 
 test('unavailable or incomplete statistics never discard a valid profile balance', async () => {
-  for (const stats of [null, { today_actual_cost: '0.0042' }]) {
+  for (const stats of [null, { total_actual_cost: '0.0042' }]) {
     const adapter = loadAdapter(async url => String(url).endsWith('/user/profile')
       ? json({ code: 0, data: { balance: 1.2345 } })
       : stats ? json({ code: 0, data: stats }) : json({ message: 'Not Found' }, 404));
@@ -229,7 +263,7 @@ test('account authentication failures are not hidden by fallback endpoints', asy
     return json({ message: 'Expired' }, 401);
   });
   await assert.rejects(adapter.getBalance(record), error => error.status === 401 && /重新连接账户/.test(error.message));
-  assert.equal(calls, 3); // Profile, dashboard statistics, and recent usage each run once.
+  assert.equal(calls, 3); // Profile, usage statistics, and recent usage each run once.
 });
 
 test('capture separates refresh_token from the Bearer token and prefers auth_token', async () => {

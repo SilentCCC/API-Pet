@@ -110,12 +110,12 @@ AI Provider 标题栏的“一键刷新账户”会依次连接已配置为 Sub2
 
 | 类型 | 账户与余额能力 |
 | --- | --- |
-| Sub2API | 账户连接、余额、今日统计及令牌导入；上游提供输入和缓存 Token 时显示缓存命中率，按缓存 Token ÷（缓存 Token + 输入 Token）计算；兼容 `/api/v1/user/profile` 和 `/api/v1/auth/me` |
-| New API | 账户连接、余额、可用的今日统计及完整令牌导入；需要有效用户 ID |
+| Sub2API | 账户连接、余额、最近24小时 Token、请求、实际消耗统计及令牌导入；使用记录页统计接口 `/api/v1/usage/stats` 携带近24小时对应的起止日期和本机时区；上游提供输入和缓存 Token 时显示缓存命中率，按缓存 Token ÷（缓存 Token + 输入 Token）计算；兼容 `/api/v1/user/profile` 和 `/api/v1/auth/me` |
+| New API | 账户连接、余额、最近24小时 Token、请求、消耗统计及完整令牌导入；需要有效用户 ID |
 | AIHub | 账户连接、余额、今日统计及完整令牌导入；金额按 micro / 1000000 换算 |
 | 仅保存站点(不查询余额) | 保留 Key、模型测试、对话、绘图和转发，跳过所有余额查询 |
 
-New API 自动读取登录网页的 `localStorage.uid`，请求时发送 `New-Api-User`；也可在编辑窗口手动填写用户 ID。余额使用 `/api/user/self`，统计兼容 `/api/performance/stats` 和 `/api/performance/logs`，完整密钥通过 `POST /api/token/{id}/key` 获取。
+New API 自动读取登录网页的 `localStorage.uid`，请求时发送 `New-Api-User`；也可在编辑窗口手动填写用户 ID。余额使用 `/api/user/self`；24小时统计优先汇总数据看板 `/api/data/self` 返回的调用次数、Token 和额度，时间范围为当前时间向前24小时。该接口不可用时，使用相同时间范围的 `/api/log/self/stat` 和分页消费日志补充，避免只计算前100条。统计获取失败时显示 `--`，不使用本地今日记录代替。完整密钥通过 `POST /api/token/{id}/key` 获取。
 
 AIHub 使用 `/api/users/me` 验证账户、`/api/billing/balance` 查询余额、`/api/keys` 导入密钥，`/api/usage/aggregate` 读取 UTC 当日统计。Sub2API 和 AIHub 统计接口不可用时仍保留已获取的余额。
 

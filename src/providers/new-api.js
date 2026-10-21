@@ -206,23 +206,27 @@ function authContext(provider, origin, signal) {
   return { ...context, refresh };
 }
 
-function todayStart() {
-  const now = new Date();
-  return new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+function dashboardStats(payload) {
+  const rows = Array.isArray(payload) ? payload : payload?.items;
+  if (!Array.isArray(rows)) return null;
+  if (rows.some(row => ['count', 'quota', 'token_used'].some(key => parseNumber(row?.[key]) == null))) return null;
+  const sum = key => rows.reduce((total, row) => total + parseNumber(row[key]), 0);
+  // Keep the existing storage fields for compatibility; New API uses a rolling 24h range.
+  return { todayRequests: sum('count'), todayCost: sum('quota') / QUOTA_PER_DOLLAR, todayTokens: sum('token_used') };
 }
 
-function statsFromPayload(summary, logs) {
+function statsFromPayload(summary, logs, range) {
   // /log/self/stat supplies the dashboard's full-range cost, independently of
   // the current page of logs. Its quota is always in New API internal units.
   const summaryQuota = parseNumber(summary?.quota);
-  const entries = findCollection(logs, ['logs', 'items', 'records']) || [];
-  const today = entries.filter(entry => {
+  const entries = findCollection(logs, ['logs', 'items', 'records']);
+  const recent = (entries || []).filter(entry => {
     const raw = entry?.created_at || entry?.createdAt || entry?.time || entry?.timestamp || entry?.date;
     if (!raw) return true;
     const timestamp = typeof raw === 'number' ? (raw < 1e12 ? raw * 1000 : raw) : Date.parse(raw);
-    return !Number.isFinite(timestamp) || (timestamp >= todayStart() && timestamp <= Date.now());
+    return !Number.isFinite(timestamp) || (timestamp >= Number(range.get('start_timestamp')) * 1000 && timestamp <= Number(range.get('end_timestamp')) * 1000);
   });
-  const rows = today;
+  const rows = recent;
   const usageRows = rows.filter(row => {
     const type = parseNumber(row?.type);
     if (type != null) return type === 2;
@@ -231,35 +235,42 @@ function statsFromPayload(summary, logs) {
   });
   const hasTypedRows = rows.some(row => parseNumber(row?.type) != null);
   const countedRows = usageRows.length ? usageRows : hasTypedRows ? [] : rows;
-  const usageSum = keys => countedRows.reduce((total, row) => {
-    const raw = keys.map(key => row?.[key]).find(value => value != null);
-    return total + (parseNumber(raw) || 0);
-  }, 0);
-  const logCost = countedRows.length ? normalizeCost(usageSum(['cost', 'quota', 'spend', 'amount'])) : 0;
+  const logCost = countedRows.reduce((total, row) => total + (row.quota != null ? (parseNumber(row.quota) || 0) / QUOTA_PER_DOLLAR : normalizeCost(row.cost ?? row.spend ?? row.amount) || 0), 0);
   const logTokens = countedRows.length ? countedRows.reduce((total, row) => {
     const combined = parseNumber(row?.total_tokens ?? row?.totalTokens);
     return total + (combined != null ? combined : (parseNumber(row?.prompt_tokens ?? row?.input_tokens) || 0) + (parseNumber(row?.completion_tokens ?? row?.output_tokens) || 0));
   }, 0) : 0;
   const durations = countedRows.map(row => normalizeDuration(row?.duration_ms ?? row?.durationMs ?? row?.duration ?? row?.use_time ?? row?.latency_ms)).filter(Number.isFinite);
   return {
-    todayCost: summaryQuota != null ? summaryQuota / QUOTA_PER_DOLLAR : logCost,
-    todayRequests: countedRows.length,
-    todayTokens: logTokens,
+    todayCost: summaryQuota != null ? summaryQuota / QUOTA_PER_DOLLAR : entries ? logCost : null,
+    todayRequests: entries ? countedRows.length : null,
+    todayTokens: entries ? logTokens : null,
     averageDurationMs: durations.length ? durations.reduce((a, b) => a + b, 0) / durations.length : null
   };
 }
 
-function todayQuery() {
-  const start = Math.floor(todayStart() / 1000);
-  const end = Math.floor(Date.now() / 1000) + 1;
-  return new URLSearchParams({ start_timestamp: String(start), end_timestamp: String(end) });
+function last24HoursQuery() {
+  const end = Math.floor(Date.now() / 1000);
+  return new URLSearchParams({ start_timestamp: String(end - 86400), end_timestamp: String(end) });
 }
 
-async function getTodayLogs(origin, request, controller, range) {
+async function getUsageLogs(origin, request, controller, range, firstPageOnly = false) {
   const query = new URLSearchParams(range);
-  query.set('p', '1');
   query.set('page_size', '100');
-  return getJson(`${origin}/api/log/self?${query}`, request.headers, controller.signal, 'GET', request.refresh);
+  query.set('type', '2');
+  const items = [];
+  for (let page = 1; page <= 100; page += 1) {
+    query.set('p', String(page));
+    const payload = await getJson(`${origin}/api/log/self?${query}`, request.headers, controller.signal, 'GET', request.refresh);
+    const rows = findCollection(payload, ['logs', 'items', 'records']);
+    if (!rows) return null;
+    items.push(...rows);
+    const total = parseNumber(payload?.total);
+    if (firstPageOnly || (total != null ? items.length >= total : rows.length < 100)) return { items };
+    if (!rows.length) return null;
+  }
+  // Never publish a truncated page as the complete 24-hour total.
+  return null;
 }
 
 module.exports = {
@@ -329,17 +340,21 @@ module.exports = {
       const rawBalance = findNumber(user, ['quota', 'remaining_quota', 'remainingQuota', 'balance', 'credit']);
       const balance = quotaAmount(rawBalance);
       if (balance == null) throw new Error('New API /api/user/self 响应中没有可识别的 quota 或 balance 字段');
-      const range = todayQuery();
+      const range = last24HoursQuery();
+      const dashboardQuery = new URLSearchParams(range);
+      dashboardQuery.set('default_time', 'hour');
+      const dashboard = await getJson(`${origin}/api/data/self?${dashboardQuery}`, request.headers, controller.signal, 'GET', request.refresh)
+        .then(dashboardStats).catch(() => null);
       const [summary, logs] = await Promise.all([
-        getJson(`${origin}/api/log/self/stat?${range}`, request.headers, controller.signal, 'GET', request.refresh).catch(() => null),
-        getTodayLogs(origin, request, controller, range).catch(() => null)
+        dashboard ? Promise.resolve(null) : getJson(`${origin}/api/log/self/stat?${range}`, request.headers, controller.signal, 'GET', request.refresh).catch(() => null),
+        getUsageLogs(origin, request, controller, range, Boolean(dashboard)).catch(() => null)
       ]);
-      const parsedStats = statsFromPayload(summary, logs);
+      const parsedStats = { ...statsFromPayload(summary, logs, range), ...(dashboard || {}) };
       const accountStats = Object.fromEntries(Object.entries(parsedStats).filter(([, value]) => value != null && Number.isFinite(Number(value))));
       return {
         balance,
         ...balanceCurrency(provider, [user, profile], Math.abs(rawBalance) >= 10000 ? '$' : ''),
-        ...(Object.keys(accountStats).length ? { accountStats } : {})
+        accountStats
       };
     } finally {
       clearTimeout(timer);

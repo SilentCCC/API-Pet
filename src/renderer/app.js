@@ -426,7 +426,8 @@ async function sortProviders(key) {
     if (key === 'name') return String(provider.name || '').trim();
     if (key === 'consumption') {
       if (provider.balanceAdapter === 'none') return null;
-      const accountCost = Number(provider.accountStats?.todayCost);
+      const accountCost = provider.accountStats?.todayCost == null ? NaN : Number(provider.accountStats.todayCost);
+      if (['new-api', 'sub2api'].includes(provider.balanceAdapter)) return Number.isFinite(accountCost) ? accountCost : null;
       const localCost = Number(provider.dailyStats?.cost);
       const amount = Number.isFinite(accountCost) ? accountCost : localCost;
       return Number.isFinite(amount) ? amount : null;
@@ -498,9 +499,11 @@ function render() {
     const checked = balance.updatedAt ? new Date(balance.updatedAt).toLocaleString() : '尚未查询';
     const stats = provider.dailyStats || {};
     const accountStats = skipBalance ? {} : provider.accountStats || {};
+    const uses24HourStats = ['new-api', 'sub2api'].includes(provider.balanceAdapter);
+    const usagePeriod = uses24HourStats ? '24小时' : '今日';
     const hasAccountStats = Number.isFinite(Number(accountStats.todayCost)) && Number.isFinite(Number(accountStats.todayRequests));
     const localRequests = Number(stats.requestCount) || 0;
-    const requests = hasAccountStats ? Number(accountStats.todayRequests) : localRequests;
+    const requests = uses24HourStats ? accountStats.todayRequests == null ? '--' : Number(accountStats.todayRequests) : hasAccountStats ? Number(accountStats.todayRequests) : localRequests;
     const successRate = localRequests ? `${((Number(stats.successCount) || 0) / localRequests * 100).toFixed(1)}%` : '--';
     const todayTokens = accountStats.todayTokens != null && Number.isFinite(Number(accountStats.todayTokens)) ? Number(accountStats.todayTokens).toLocaleString() : '--';
     const formatCacheRate = value => value != null && Number.isFinite(Number(value)) ? `${(Number(value) * 100).toFixed(2)}%` : '--';
@@ -508,7 +511,7 @@ function render() {
     const cacheHitRateRecent20 = formatCacheRate(accountStats.cacheHitRateRecent20 ?? accountStats.cacheHitRate);
     const averageResponseMs = accountStats.averageDurationMs != null ? Number(accountStats.averageDurationMs) : NaN;
     const averageResponse = Number.isFinite(averageResponseMs) ? `${(averageResponseMs / 1000).toFixed(2)} 秒` : '--';
-    const consumption = hasAccountStats ? `${escapeHtml(provider.currency || balance.currency || '$')}${Number(accountStats.todayCost).toFixed(4)}` : Number.isFinite(Number(stats.cost)) ? `${escapeHtml(stats.costCurrency || provider.currency || '$')}${Number(stats.cost).toFixed(4)}` : Number(stats.usageTokens) > 0 ? `${Number(stats.usageTokens).toLocaleString()} tokens` : '--';
+    const consumption = (uses24HourStats ? accountStats.todayCost != null : hasAccountStats) ? `${escapeHtml(provider.currency || balance.currency || '$')}${Number(accountStats.todayCost).toFixed(4)}` : uses24HourStats ? '--' : Number.isFinite(Number(stats.cost)) ? `${escapeHtml(stats.costCurrency || provider.currency || '$')}${Number(stats.cost).toFixed(4)}` : Number(stats.usageTokens) > 0 ? `${Number(stats.usageTokens).toLocaleString()} tokens` : '--';
     const connectButton = ['sub2api', 'new-api', 'aihub'].includes(provider.balanceAdapter) ? '<button class="connect-account">连接账户</button>' : '';
     const displayUrl = provider.requestUrl || provider.loginUrl || provider.baseUrl || '';
   const balanceConnection = balance.apiStatus === 'online' ? '🟢 连接正常' : balance.apiStatus === 'error' ? '🔴 连接失败' : '🟡 未测试';
@@ -519,11 +522,11 @@ function render() {
   if (compact) {
     card.classList.add('provider-card-compact');
     if (providersCollapsed) setupProviderDragSort(card);
-    const compactConsumption = formatCompactMoney(skipBalance ? null : hasAccountStats ? accountStats.todayCost : stats.cost, hasAccountStats ? provider.currency || balance.currency : stats.costCurrency || provider.currency);
+    const compactConsumption = formatCompactMoney(skipBalance ? null : uses24HourStats || hasAccountStats ? accountStats.todayCost : stats.cost, uses24HourStats || hasAccountStats ? provider.currency || balance.currency : stats.costCurrency || provider.currency);
     const compactBalance = formatCompactMoney(skipBalance ? null : balance.balance, provider.currency || balance.currency);
-    card.innerHTML = `<div class="provider-compact-name" title="${escapeHtml(provider.name)}">${escapeHtml(provider.name)}</div><b class="provider-compact-consumption" title="今日消耗：${escapeHtml(compactConsumption)}">${escapeHtml(compactConsumption)}</b><span class="provider-compact-models" title="${provider.models?.length || 0}个模型">${provider.models?.length || 0}个模型</span><b class="provider-compact-balance" title="余额：${escapeHtml(compactBalance)}">${escapeHtml(compactBalance)}</b><span class="provider-compact-status" title="${statusLabel(provider)}" aria-label="${statusLabel(provider)}">${connectionIcon}</span><div class="provider-compact-actions"><button class="provider-toggle compact-toggle" type="button" aria-label="展开 ${escapeHtml(provider.name)}">⌄</button></div>`;
+    card.innerHTML = `<div class="provider-compact-name" title="${escapeHtml(provider.name)}">${escapeHtml(provider.name)}</div><b class="provider-compact-consumption" title="${usagePeriod}消耗：${escapeHtml(compactConsumption)}">${escapeHtml(compactConsumption)}</b><span class="provider-compact-models" title="${provider.models?.length || 0}个模型">${provider.models?.length || 0}个模型</span><b class="provider-compact-balance" title="余额：${escapeHtml(compactBalance)}">${escapeHtml(compactBalance)}</b><span class="provider-compact-status" title="${statusLabel(provider)}" aria-label="${statusLabel(provider)}">${connectionIcon}</span><div class="provider-compact-actions"><button class="provider-toggle compact-toggle" type="button" aria-label="展开 ${escapeHtml(provider.name)}">⌄</button></div>`;
   } else {
-    card.innerHTML = `<div class="provider-top"><div><div class="provider-name">${escapeHtml(provider.name)}</div><div class="provider-url">请求：${escapeHtml(displayUrl)}${provider.loginUrl && provider.loginUrl !== displayUrl ? `<br>登录：${escapeHtml(provider.loginUrl)}` : ''}</div></div><div class="provider-top-actions"><span class="badge ${provider.status}">${statusLabel(provider)} · ${provider.models?.length || 0} 个模型</span><button class="provider-toggle" type="button" aria-label="折叠 ${escapeHtml(provider.name)}">⌃</button></div></div>${skipBalance ? '' : `<div class="balance-line"><b>${amount}</b><span>${balanceLabel(provider)}</span></div><div class="balance-meta"><span>余额接口：${balanceConnection}</span><span>查询：${escapeHtml(checked)}</span></div>`}<div class="provider-stats"><span>近20条缓存命中率：${cacheHitRateRecent20}</span><span>24小时缓存命中率：${cacheHitRate24h}</span><span>今日 Token：${todayTokens}</span><span>今日请求：${requests} 次</span><span>平均响应：${averageResponse}</span><span>今日消耗：${consumption}</span></div>${!skipBalance && balance.error ? `<div class="balance-error">${escapeHtml(balance.error)}</div>` : ''}${provider.error ? `<div class="balance-error">${escapeHtml(provider.error)}</div>` : ''}<div class="provider-actions">${connectButton}<button class="test">测试连接</button>${skipBalance ? '' : '<button class="refresh-balance">刷新余额</button>'}<button class="edit">编辑</button><button class="delete">删除</button><button class="open-login">登录站点</button></div>`;
+    card.innerHTML = `<div class="provider-top"><div><div class="provider-name">${escapeHtml(provider.name)}</div><div class="provider-url">请求：${escapeHtml(displayUrl)}${provider.loginUrl && provider.loginUrl !== displayUrl ? `<br>登录：${escapeHtml(provider.loginUrl)}` : ''}</div></div><div class="provider-top-actions"><span class="badge ${provider.status}">${statusLabel(provider)} · ${provider.models?.length || 0} 个模型</span><button class="provider-toggle" type="button" aria-label="折叠 ${escapeHtml(provider.name)}">⌃</button></div></div>${skipBalance ? '' : `<div class="balance-line"><b>${amount}</b><span>${balanceLabel(provider)}</span></div><div class="balance-meta"><span>余额接口：${balanceConnection}</span><span>查询：${escapeHtml(checked)}</span></div>`}<div class="provider-stats"><span>近20条缓存命中率：${cacheHitRateRecent20}</span><span>24小时缓存命中率：${cacheHitRate24h}</span><span>${usagePeriod} Token：${todayTokens}</span><span>${usagePeriod}请求：${requests} 次</span><span>平均响应：${averageResponse}</span><span>${usagePeriod}消耗：${consumption}</span></div>${!skipBalance && balance.error ? `<div class="balance-error">${escapeHtml(balance.error)}</div>` : ''}${provider.error ? `<div class="balance-error">${escapeHtml(provider.error)}</div>` : ''}<div class="provider-actions">${connectButton}<button class="test">测试连接</button>${skipBalance ? '' : '<button class="refresh-balance">刷新余额</button>'}<button class="edit">编辑</button><button class="delete">删除</button><button class="open-login">登录站点</button></div>`;
   }
   card.querySelector('.provider-toggle')?.addEventListener('click', () => {
     if (providersCollapsed) {
@@ -1032,7 +1035,7 @@ async function connectProviderAccount(id, loginUrl = '', { silent = false, useDr
       updateCurrencyFields();
     }
     render();
-    if (!silent) toast(result.ok ? result.openedOnly ? '已在内置浏览器打开站点' : '账户已连接，余额和今日统计已更新' : `连接失败：${result.error}`);
+    if (!silent) toast(result.ok ? result.openedOnly ? '已在内置浏览器打开站点' : `账户已连接，余额和${['new-api', 'sub2api'].includes(result.provider?.balanceAdapter || appState.providers.find(provider => provider.id === id)?.balanceAdapter) ? '24小时' : '今日'}统计已更新` : `连接失败：${result.error}`);
     return result;
   } finally {
     connectingAccounts = Math.max(0, connectingAccounts - 1);

@@ -29,6 +29,7 @@ let releaseBatchQuery;
 let batchIpcFails = false;
 let batchIpcCalls = 0;
 const context = vm.createContext({
+  gatewayLanUrls: () => [],
   accountSessions: { restore() {} },
   ...require('../src/provider-currency'),
   state, app, ipcMain, crypto, AbortController, setTimeout, clearTimeout,

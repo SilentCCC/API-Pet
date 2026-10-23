@@ -20,7 +20,10 @@ async function gateway(t, options = {}) {
   const state = { routingEnabled: true, routingMode: 'unified', routes: {}, providers: [provider], unifiedKey: 'test-local-key',
     unifiedRoute: { providerId: 'test', model: 'upstream-model', format: options.legacyFormat }, ...options.state };
   const calls = [];
-  const context = vm.createContext({ state, http, PORT: 0, Buffer, console, mainWindow: null,
+  const context = vm.createContext({ state, http: options.remoteAddress ? { createServer: handler => http.createServer((req, res) => {
+      Object.defineProperty(req.socket, 'remoteAddress', {value:options.remoteAddress,configurable:true});
+      return handler(req,res);
+    }) } : http, PORT: 0, Buffer, console, mainWindow: null,
     providerModels: item => item.models,
     providerBaseUrls: item => [item.requestUrl],
     selectProviderApiKey: item => item.apiKey,
@@ -30,7 +33,7 @@ async function gateway(t, options = {}) {
       return options.response?.() || Response.json({ output_text: 'test reply' });
     }
   });
-  ['unifiedRouteKey', 'resolveRequestedModel', 'findProviderForModel', 'allModels', 'modelsForApiKey', 'gatewayCredential', 'gatewayRouting', 'authOk', 'writeJson', 'proxyChat', 'startGateway'].forEach(name => include(context, name));
+  ['unifiedRouteKey', 'resolveRequestedModel', 'findProviderForModel', 'allModels', 'modelsForApiKey', 'isLanAddress', 'gatewayAccessAllowed', 'gatewayListenHost', 'gatewayCredential', 'gatewayRouting', 'authOk', 'writeJson', 'proxyChat', 'startGateway'].forEach(name => include(context, name));
   context.startGateway();
   const server = context.gateway;
   t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
@@ -39,7 +42,7 @@ async function gateway(t, options = {}) {
   const send = (endpoint, body, key = 'test-local-key') => fetch(base + endpoint, {
     method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body)
   });
-  return { calls, state, send, base };
+  return { calls, state, send, base, context, server };
 }
 
 for (const legacyFormat of ['responses', 'chat/completions']) {
@@ -123,7 +126,7 @@ test('site Key route maps the local API Pet Key to the selected site Key', async
     recordProviderRequest() {}, recordProviderResult() {}, persist() {}, extractUsage: () => ({}),
     fetch: async (url, request) => { calls.push({ url, headers: request.headers, body: JSON.parse(request.body) }); return Response.json({ output_text: 'ok' }); }
   });
-  ['cleanBaseUrl', 'providerModels', 'providerBaseUrls', 'selectProviderApiKey', 'modelsForApiKey', 'gatewayCredential', 'gatewayRouting', 'unifiedRouteKey', 'resolveRequestedModel', 'findProviderForModel', 'allModels', 'authOk', 'writeJson', 'proxyChat', 'startGateway'].forEach(name => include(context, name));
+  ['cleanBaseUrl', 'providerModels', 'providerBaseUrls', 'selectProviderApiKey', 'modelsForApiKey', 'isLanAddress', 'gatewayAccessAllowed', 'gatewayListenHost', 'gatewayCredential', 'gatewayRouting', 'unifiedRouteKey', 'resolveRequestedModel', 'findProviderForModel', 'allModels', 'authOk', 'writeJson', 'proxyChat', 'startGateway'].forEach(name => include(context, name));
   context.startGateway();
   const server = context.gateway;
   t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
@@ -314,13 +317,18 @@ test('second route configuration persists without changing the original Key and 
   assert.notEqual(migrated.secondaryRouting.unifiedKey, saved.unifiedKey);
   assert.match(migrated.secondaryRouting.unifiedKey, /^pet-/);
   assert.equal(migrated.secondaryRouting.routingEnabled, false);
+  assert.equal(migrated.lanAccess, false);
+  assert.equal(migrated.secondaryRouting.lanAccess, false);
   saved.secondaryRouting = JSON.parse(JSON.stringify(migrated.secondaryRouting));
   saved.secondaryRouting.routingEnabled = true;
+  saved.secondaryRouting.lanAccess = true;
   saved.secondaryRouting.routingMode = 'key';
   saved.secondaryRouting.keyRoute = { providerId: 'site', apiKey: 'upstream', models: ['model'] };
   const loaded = context.loadState();
   assert.equal(loaded.secondaryRouting.unifiedKey, saved.secondaryRouting.unifiedKey);
   assert.equal(loaded.secondaryRouting.keyRoute.apiKey, 'upstream');
+  assert.equal(loaded.secondaryRouting.lanAccess, true);
+  assert.equal(loaded.lanAccess, false);
   saved.providers[0].apiKeys = [];
   assert.equal(context.loadState().secondaryRouting.keyRoute.apiKey, '');
 });
@@ -356,4 +364,75 @@ test('IPC selections, mode switches and pending model fetches stay within their 
   await handlers['set-key-route'](null, { providerId: 'site', keyIndex: 1 }, 2);
   assert.equal(state.secondaryRouting.keyRoute.apiKey, 'b');
   assert.equal(state.keyRoute.apiKey, undefined);
+});
+
+
+test('LAN access follows the authenticated route Key for both model lists and forwarding', async t => {
+  for (const allowedGroup of [1,2]) {
+    const first = {lanAccess:allowedGroup===1, secondaryRouting:{unifiedKey:'second-local',routingEnabled:true,routingMode:'unified',routes:{},unifiedRoute:{providerId:'test',model:'upstream-model'},lanAccess:allowedGroup===2}};
+    const {base,send,calls,server}=await gateway(t,{state:first,remoteAddress:'192.168.0.22'});
+    assert.equal(server.address().address,'0.0.0.0');
+    for (const [group,key] of [[1,'test-local-key'],[2,'second-local']]) {
+      const expected=group===allowedGroup?200:403;
+      const models=await fetch(base+'/models',{headers:{Authorization:'Bearer '+key,'X-Forwarded-For':'127.0.0.1'}});
+      assert.equal(models.status,expected);
+      for(const endpoint of ['/responses','/chat/completions']) {
+        const reply=await send(endpoint,{model:'Pet model'},key);
+        assert.equal(reply.status,expected);
+        await reply.text();
+      }
+    }
+    assert.equal(calls.length,2);
+    assert.equal((await send('/responses',{model:'Pet model'},'invalid')).status,401);
+  }
+});
+
+test('loopback forms always work and public or missing peers cannot use a LAN-enabled Key',()=>{
+  const context=vm.createContext({});
+  ['isLanAddress','gatewayAccessAllowed'].forEach(name=>include(context,name));
+  for(const address of ['127.0.0.1','127.0.0.2','::1','::ffff:127.0.0.1']) {
+    assert.equal(context.gatewayAccessAllowed({socket:{remoteAddress:address}},{lanAccess:false}),true);
+  }
+  for(const address of ['192.168.0.22','10.1.1.2','172.16.1.2','172.31.0.1','::ffff:192.168.0.22']) {
+    assert.equal(context.gatewayAccessAllowed({socket:{remoteAddress:address}},{lanAccess:true}),true);
+    assert.equal(context.gatewayAccessAllowed({socket:{remoteAddress:address}},{lanAccess:false}),false);
+  }
+  for(const address of ['8.8.8.8','172.32.1.1','192.168.1.999','',undefined]) {
+    assert.equal(context.gatewayAccessAllowed({socket:{remoteAddress:address}},{lanAccess:true}),false);
+  }
+});
+
+test('independent LAN switches rebind immediately and serialize overlapping updates',async t=>{
+  const {context,state,server}=await gateway(t);
+  assert.equal(server.address().address,'127.0.0.1');
+  state.secondaryRouting={lanAccess:false};
+  context.safeState=()=>JSON.parse(JSON.stringify(state));
+  vm.runInContext('let gatewaySettingsQueue = Promise.resolve()',context);
+  ['restartGateway','setRoutingLanAccess'].forEach(name=>include(context,name));
+  t.after(()=>new Promise(resolve=>{if(!context.gateway)return resolve();context.gateway.close(resolve);context.gateway.closeAllConnections();}));
+  await context.setRoutingLanAccess(true,2);
+  assert.equal(context.gateway.address().address,'0.0.0.0');
+  assert.equal(state.lanAccess,undefined);
+  assert.equal(state.secondaryRouting.lanAccess,true);
+  await Promise.all([context.setRoutingLanAccess(true,1),context.setRoutingLanAccess(false,2)]);
+  assert.equal(state.lanAccess,true);
+  assert.equal(state.secondaryRouting.lanAccess,false);
+  assert.equal(context.gateway.address().address,'0.0.0.0');
+  await context.setRoutingLanAccess(false,1);
+  assert.equal(context.gateway.address().address,'127.0.0.1');
+  const response=await fetch('http://127.0.0.1:'+context.gateway.address().port+'/v1/models',{headers:{Authorization:'Bearer test-local-key'}});
+  assert.equal(response.status,200);
+  await response.text();
+});
+
+test('LAN address listing filters external and loopback interfaces and removes duplicates',()=>{
+  const context=vm.createContext({PORT:8787,os:{networkInterfaces:()=>({ethernet:[
+    {family:'IPv4',address:'192.168.0.11',internal:false},
+    {family:'IPv4',address:'192.168.0.11',internal:false},
+    {family:'IPv4',address:'8.8.8.8',internal:false},
+    {family:'IPv4',address:'127.0.0.1',internal:true},
+    {family:'IPv6',address:'::1',internal:true}
+  ]})}});
+  ['isLanAddress','gatewayLanUrls'].forEach(name=>include(context,name));
+  assert.deepEqual(Array.from(context.gatewayLanUrls()),['http://192.168.0.11:8787/v1']);
 });

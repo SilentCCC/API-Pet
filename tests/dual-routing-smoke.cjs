@@ -14,7 +14,12 @@ const state = { ...config('first'), secondaryRouting: config('second'), balanceS
     apiKey: id + '-key', apiKeys: [{ key: id + '-key', remark: id + '账户', enabled: true }] })) };
 let saved;
 const context = vm.createContext({ state, ipcMain,
-  persist: () => { saved = JSON.parse(JSON.stringify(state)); }, safeState: () => JSON.parse(JSON.stringify(state)),
+  persist: () => { saved = JSON.parse(JSON.stringify(state)); }, safeState: () => ({...JSON.parse(JSON.stringify(state)),lanUrls:['http://192.168.0.11:8787/v1']}),
+  setRoutingLanAccess: async (enabled, group) => {
+    if (context.lanFails) throw new Error('Test LAN bind failed');
+    (group===2?state.secondaryRouting:state).lanAccess=enabled===true;
+    context.persist(); return context.safeState();
+  },
   providerModels: p => p.models, fetchModels: async (_provider, key) => { await new Promise(resolve => setTimeout(resolve, 30)); return [key.replace('-key', '-model')]; }
 });
 function include(name) {
@@ -66,6 +71,19 @@ async function run() {
   assert.equal(await execute(`$('unifiedKey2').textContent`), state.secondaryRouting.unifiedKey);
   await execute(`window.copies=[]; Object.defineProperty(navigator,'clipboard',{configurable:true,value:{writeText:async text=>window.copies.push(text)}}); $('copyKey').click(); $('copyKey2').click();`);
   assert.deepEqual(await execute('window.copies'), [state.unifiedKey, state.secondaryRouting.unifiedKey]);
+  assert.equal(await execute(`!$('routingLanAccess').checked && !$('routingLanAccess2').checked && $('lanAddresses').classList.contains('hidden') && $('lanAddresses2').classList.contains('hidden')`),true);
+  await execute(`$('routingLanAccess2').click()`);
+  await until(`!$('routingLanAccess2').disabled && appState.secondaryRouting.lanAccess===true`);
+  assert.equal(state.lanAccess,undefined);
+  assert.equal(saved.secondaryRouting.lanAccess,true);
+  assert.equal(await execute(`$('lanAddresses2').textContent.includes('http://192.168.0.11:8787/v1') && $('lanAddresses').classList.contains('hidden')`),true);
+  await execute(`$('lanAddresses2').querySelector('button').click()`);
+  await until(`window.copies.at(-1)==='http://192.168.0.11:8787/v1'`);
+  context.lanFails=true;
+  await execute(`$('routingLanAccess').click()`);
+  await until(`!$('routingLanAccess').disabled`);
+  assert.equal(await execute(`$('routingLanAccess').checked`),false);
+  context.lanFails=false;
   const firstBefore = JSON.stringify({ routingMode: state.routingMode, unifiedRoute: state.unifiedRoute, routes: state.routes });
   await execute(`$('routingMode2').value='key'; $('routingMode2').dispatchEvent(new Event('change'));`);
   await until(`$('keyRouteProvider2') && $('routingModeDescription2').textContent.includes('转换')`);

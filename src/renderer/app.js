@@ -686,6 +686,15 @@ function renderRoutingGroup(group) {
     key: '客户端使用 API Pet Key，API Pet 将请求转换为控制面板选定的站点 Key。'
   };
   $('routingEnabled').checked = enabled;
+  $('routingLanAccess').checked = routing.lanAccess === true;
+  $('lanAddresses').classList.toggle('hidden', routing.lanAccess !== true);
+  $('lanAddresses').innerHTML = (appState.lanUrls || []).length
+    ? appState.lanUrls.map(url => `<div class="gateway-field"><span>局域网:</span><code>${escapeHtml(url)}</code><button type="button" class="ghost small">复制Url</button></div>`).join('')
+    : '<p class="lan-address-note">未检测到局域网 IPv4 地址，请检查网络连接。</p>';
+  $('lanAddresses').querySelectorAll('button').forEach(button => { button.onclick = async () => {
+    try { await navigator.clipboard.writeText(button.previousElementSibling.textContent); toast('局域网地址已复制'); }
+    catch { toast('复制失败，请手动复制'); }
+  }; });
   $('routingMode').value = unified ? 'unified' : keyMode ? 'key' : 'model';
   if ($('routingModeDescription')) $('routingModeDescription').textContent = modeDescriptions[routing.routingMode] || modeDescriptions.model;
   $('unifiedRoute').classList.toggle('hidden', !enabled || (!unified && !keyMode));
@@ -1720,6 +1729,15 @@ window.addEventListener('DOMContentLoaded', async () => {
   $('refreshAllBalances').onclick = refreshAllProviderBalances;
   $('saveBalanceSettings').onclick = async () => { appState = await window.apiPet.setBalanceSettings({ lowThreshold: $('lowThreshold').value, refreshMinutes: $('refreshMinutes').value }); render(); toast('余额设置已保存'); };
   for (const group of [1, 2]) {
+    routeElement('routingLanAccess', group).onchange = async () => {
+      const toggle = routeElement('routingLanAccess', group);
+      toggle.disabled = true;
+      try {
+        appState = await window.apiPet.setRoutingLanAccess(toggle.checked, group);
+        toast(`路由设置${group}${routingState(group).lanAccess ? '已允许局域网访问；连接不通时请检查防火墙 TCP 8787' : '已限制为本机访问'}`);
+      } catch (error) { toast(String(error.message || error)); }
+      finally { renderMode(); toggle.disabled = false; }
+    };
     routeElement('copyKey', group).onclick = () => copyGatewayValue('unifiedKey' + (group === 2 ? '2' : ''), `路由设置${group} Key`);
     routeElement('copyModel', group).onclick = () => copyGatewayValue('unifiedModel' + (group === 2 ? '2' : ''), 'Pet 模型');
     routeElement('routingEnabled', group).onchange = async () => {

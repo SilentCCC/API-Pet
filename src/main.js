@@ -3,6 +3,7 @@ const path = require('path');
 const fs = require('fs');
 const http = require('http');
 const crypto = require('crypto');
+const os = require('os');
 const balanceAdapters = require('./providers');
 const { currencySettings, rememberCurrency } = require('./provider-currency');
 const { requestImage, imageData } = require('./image-generation');
@@ -188,6 +189,7 @@ function defaultState() {
     providers: [],
     routes: {},
     routingEnabled: false,
+    lanAccess: false,
     routingMode: 'model',
     alwaysOnTop: true,
     chatFormat: 'responses',
@@ -195,7 +197,7 @@ function defaultState() {
     keyRoute: { providerId: '', apiKey: '', models: [] },
     secondaryRouting: {
       unifiedKey: `pet-${crypto.randomBytes(18).toString('hex')}`,
-      routingEnabled: false, routingMode: 'model', routes: {},
+      routingEnabled: false, lanAccess: false, routingMode: 'model', routes: {},
       unifiedRoute: { providerId: '', apiKey: '', model: '', models: [] },
       keyRoute: { providerId: '', apiKey: '', models: [] }
     },
@@ -212,6 +214,7 @@ function loadState() {
       ...defaults,
       ...saved,
       routingEnabled: saved.routingEnabled === true,
+      lanAccess: saved.lanAccess === true,
       routingMode: ['unified', 'model', 'key'].includes(saved.routingMode) ? saved.routingMode : 'model',
       alwaysOnTop: saved.alwaysOnTop !== false,
       balanceSettings: { ...defaults.balanceSettings, ...(saved.balanceSettings || {}) },
@@ -222,6 +225,7 @@ function loadState() {
         ...defaults.secondaryRouting,
         unifiedKey: typeof saved.secondaryRouting?.unifiedKey === 'string' && saved.secondaryRouting.unifiedKey && saved.secondaryRouting.unifiedKey !== saved.unifiedKey ? saved.secondaryRouting.unifiedKey : defaults.secondaryRouting.unifiedKey,
         routingEnabled: saved.secondaryRouting?.routingEnabled === true,
+        lanAccess: saved.secondaryRouting?.lanAccess === true,
         routingMode: ['unified', 'model', 'key'].includes(saved.secondaryRouting?.routingMode) ? saved.secondaryRouting.routingMode : 'model',
         routes: saved.secondaryRouting?.routes && typeof saved.secondaryRouting.routes === 'object' && !Array.isArray(saved.secondaryRouting.routes) ? saved.secondaryRouting.routes : {},
         unifiedRoute: normalizeUnifiedRoute(saved.secondaryRouting?.unifiedRoute, providers),
@@ -247,7 +251,57 @@ function persist() {
     return false;
   }
 }
-function safeState() { return { ...JSON.parse(JSON.stringify(state)), appVersion: app.getVersion() }; }
+function safeState() { return { ...JSON.parse(JSON.stringify(state)), appVersion: app.getVersion(), lanUrls: gatewayLanUrls() }; }
+function gatewayLanUrls() {
+  return [...new Set(Object.values(os.networkInterfaces()).flat().filter(item => item && !item.internal && item.family === 'IPv4' && isLanAddress(item.address)).map(item => `http://${item.address}:${PORT}/v1`))];
+}
+function isLanAddress(address) {
+  const parts = String(address || '').replace(/^::ffff:/i, '').split('.').map(Number);
+  if (parts.length !== 4 || parts.some(part => !Number.isInteger(part) || part < 0 || part > 255)) return false;
+  return parts[0] === 10 || (parts[0] === 172 && parts[1] >= 16 && parts[1] <= 31) || (parts[0] === 192 && parts[1] === 168) || (parts[0] === 169 && parts[1] === 254);
+}
+function gatewayAccessAllowed(req, routing) {
+  const address = String(req.socket?.remoteAddress || '').replace(/^::ffff:/i, '');
+  if (address === '::1' || /^127\./.test(address)) return true;
+  return routing.lanAccess === true && isLanAddress(address);
+}
+function gatewayListenHost() { return state.lanAccess === true || state.secondaryRouting?.lanAccess === true ? '0.0.0.0' : '127.0.0.1'; }
+let gatewaySettingsQueue = Promise.resolve();
+function setRoutingLanAccess(enabled, group = 1) {
+  const update = async () => {
+    const routing = group === 2 ? state.secondaryRouting : state;
+    const previous = routing.lanAccess === true;
+    const oldHost = gatewayListenHost();
+    routing.lanAccess = enabled === true;
+    try {
+      if (!gateway || oldHost !== gatewayListenHost()) await restartGateway();
+    } catch (error) {
+      routing.lanAccess = previous;
+      await restartGateway().catch(() => {});
+      throw new Error(`局域网设置失败：${error.message}`);
+    }
+    persist();
+    return safeState();
+  };
+  const pending = gatewaySettingsQueue.then(update);
+  gatewaySettingsQueue = pending.catch(() => {});
+  return pending;
+}
+async function restartGateway() {
+  if (gateway) {
+    const previous = gateway;
+    gateway = null;
+    await new Promise(resolve => { previous.close(resolve); previous.closeAllConnections(); });
+  }
+  startGateway();
+  const server = gateway;
+  await new Promise((resolve, reject) => {
+    const ready = () => { server.removeListener('error', failed); resolve(); };
+    const failed = error => { server.removeListener('listening', ready); reject(error); };
+    server.once('listening', ready);
+    server.once('error', failed);
+  });
+}
 function cleanBaseUrl(url) { return String(url || '').replace(/\/+$/, ''); }
 function todayKey() {
   const now = new Date();
@@ -1114,6 +1168,7 @@ function startGateway() {
     if (!req.url.startsWith('/v1/')) return writeJson(res, 404, { error: 'Use /v1' });
     const config = gatewayRouting(req);
     if (!config) return writeJson(res, 401, { error: { message: 'Invalid API Pet key' } });
+    if (!gatewayAccessAllowed(req, config)) return writeJson(res, 403, { error: { message: '此路由仅允许本机访问，或请求来源不属于局域网' } });
     // Capture this request's settings before reading a body or awaiting upstream I/O.
     const routing = { ...config, routes: { ...config.routes }, unifiedRoute: { ...config.unifiedRoute }, keyRoute: { ...config.keyRoute } };
     if (req.method === 'GET' && req.url === '/v1/models') {
@@ -1147,7 +1202,7 @@ function startGateway() {
     }
     console.error('API Pet gateway error:', error);
   });
-  gateway.listen(PORT, '127.0.0.1');
+  gateway.listen(PORT, gatewayListenHost());
 }
 if (gotSingleInstanceLock) app.whenReady().then(() => {
   writeStartupLog(`API Pet ${app.getVersion()} 启动`);
@@ -1426,6 +1481,7 @@ ipcMain.handle('set-key-route', async (_e, route, group = 1) => {
   return safeState();
 });
 ipcMain.handle('set-routing-enabled', (_e, enabled, group = 1) => { const routing = group === 2 ? state.secondaryRouting : state; routing.routingEnabled = enabled === true; persist(); return safeState(); });
+ipcMain.handle('set-routing-lan-access', (_e, enabled, group = 1) => setRoutingLanAccess(enabled, group));
 ipcMain.handle('set-unified-route', async (_e, route, group = 1) => {
   const routing = group === 2 ? state.secondaryRouting : state;
   const providerId = String(route?.providerId || '');

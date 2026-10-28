@@ -50,6 +50,8 @@ let draftDetectedCurrency = '';
 let draftCurrencyDetection = 'pending';
 let unifiedRouteSaving = false;
 let secondaryRouteSaving = false;
+let thirdRouteSaving = false;
+let activeRoutingGroup = 1;
 const panel = $('panel');
 const chatPanel = $('chatPanel');
 const dialog = $('providerDialog');
@@ -268,6 +270,33 @@ function setupSettingsTabs() {
       $(`${target}Tab`).focus();
     };
   });
+}
+
+function setRoutingGroup(group, resetScroll = true) {
+  activeRoutingGroup = group;
+  for (const number of [1, 2, 3]) {
+    const selected = number === group;
+    $(`routingGroup${number}`).classList.toggle('hidden', !selected);
+    const tab = $(`routingGroupTab${number}`);
+    tab.classList.toggle('active', selected);
+    tab.setAttribute('aria-selected', String(selected));
+    tab.tabIndex = selected ? 0 : -1;
+  }
+  if (resetScroll) panel.querySelector('.panel-scroll').scrollTop = 0;
+}
+
+function setupRoutingGroupTabs() {
+  for (const group of [1, 2, 3]) {
+    const tab = $(`routingGroupTab${group}`);
+    tab.onclick = () => setRoutingGroup(group);
+    tab.onkeydown = event => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const target = event.key === 'Home' ? 1 : event.key === 'End' ? 3 : (group - 1 + (event.key === 'ArrowRight' ? 1 : 2)) % 3 + 1;
+      setRoutingGroup(target);
+      $(`routingGroupTab${target}`).focus();
+    };
+  }
 }
 
 async function setChatVisible(visible) {
@@ -667,12 +696,12 @@ function updateCompactMoneyColumns() {
   list.style.setProperty('--compact-consumption-width', `${moneyColumnWidth('.provider-compact-consumption', 48)}px`);
   list.style.setProperty('--compact-balance-width', `${moneyColumnWidth('.provider-compact-balance', 64)}px`);
 }
-function routeElement(id, group = 1) { return document.getElementById(id + (group === 2 ? '2' : '')); }
+function routeElement(id, group = 1) { return document.getElementById(id + (group > 1 ? String(group) : '')); }
 function routingState(group = 1) {
-  return group === 2 ? appState.secondaryRouting || { routingEnabled: false, routingMode: 'model', routes: {}, unifiedRoute: {}, keyRoute: {} } : appState;
+  return group > 1 ? (group === 3 ? appState.thirdRouting : appState.secondaryRouting) || { routingEnabled: false, routingMode: 'model', routes: {}, unifiedRoute: {}, keyRoute: {} } : appState;
 }
-function routeMarkup(html, group) { return group === 2 ? html.replace(/\bid="([^"]+)"/g, (_match, id) => `id="${id}2"`) : html; }
-function renderMode() { renderRoutingGroup(1); renderRoutingGroup(2); }
+function routeMarkup(html, group) { return group > 1 ? html.replace(/\bid="([^"]+)"/g, (_match, id) => `id="${id}${group}"`) : html; }
+function renderMode() { [1, 2, 3].forEach(renderRoutingGroup); setRoutingGroup(activeRoutingGroup, false); }
 function renderRoutingGroup(group) {
   const $ = id => routeElement(id, group);
   const routing = routingState(group);
@@ -686,6 +715,9 @@ function renderRoutingGroup(group) {
     key: '客户端使用 API Pet Key，API Pet 将请求转换为控制面板选定的站点 Key。'
   };
   $('routingEnabled').checked = enabled;
+  $('routingRequestFormatEnabled').checked = routing.requestFormatEnabled === true;
+  $('routingRequestFormat').value = routing.requestFormat === 'chat/completions' ? 'chat/completions' : 'responses';
+  $('routingRequestFormat').disabled = routing.requestFormatEnabled !== true;
   $('routingLanAccess').checked = routing.lanAccess === true;
   $('lanAddresses').classList.toggle('hidden', routing.lanAccess !== true);
   $('lanAddresses').innerHTML = (appState.lanUrls || []).length
@@ -708,7 +740,7 @@ function renderRoutingGroup(group) {
 function renderKeyRoute(group = 1) {
   const $ = id => routeElement(id, group);
   const routing = routingState(group);
-  const saving = group === 2 ? secondaryRouteSaving : unifiedRouteSaving;
+  const saving = group === 3 ? thirdRouteSaving : group === 2 ? secondaryRouteSaving : unifiedRouteSaving;
   const route = routing.keyRoute || {};
   const provider = appState.providers.find(item => item.id === route.providerId);
   const keys = provider?.apiKeys || [];
@@ -721,8 +753,8 @@ function renderKeyRoute(group = 1) {
   $('keyRouteKey').onchange = () => saveKeyRoute({ providerId: route.providerId, keyIndex: $('keyRouteKey').value }, '站点 Key 已保存，模型列表已更新', group);
 }
 async function saveKeyRoute(input, message, group = 1) {
-  if (group === 2 ? secondaryRouteSaving : unifiedRouteSaving) return;
-  if (group === 2) secondaryRouteSaving = true; else unifiedRouteSaving = true;
+  if (group === 3 ? thirdRouteSaving : group === 2 ? secondaryRouteSaving : unifiedRouteSaving) return;
+  if (group === 3) thirdRouteSaving = true; else if (group === 2) secondaryRouteSaving = true; else unifiedRouteSaving = true;
   renderKeyRoute(group);
   try {
     appState = await window.apiPet.setKeyRoute(input, group);
@@ -731,14 +763,14 @@ async function saveKeyRoute(input, message, group = 1) {
     try { appState = await window.apiPet.getState(); } catch {}
     toast(`更新指定 Key 路由失败：${error.message}`);
   } finally {
-    if (group === 2) secondaryRouteSaving = false; else unifiedRouteSaving = false;
+    if (group === 3) thirdRouteSaving = false; else if (group === 2) secondaryRouteSaving = false; else unifiedRouteSaving = false;
     renderMode();
   }
 }
 function renderUnifiedRoute(group = 1) {
   const $ = id => routeElement(id, group);
   const routing = routingState(group);
-  const saving = group === 2 ? secondaryRouteSaving : unifiedRouteSaving;
+  const saving = group === 3 ? thirdRouteSaving : group === 2 ? secondaryRouteSaving : unifiedRouteSaving;
   const route = routing.unifiedRoute || {};
   const provider = appState.providers.find(item => item.id === route.providerId);
   const keys = provider?.apiKeys || [];
@@ -754,8 +786,8 @@ function renderUnifiedRoute(group = 1) {
   $('unifiedTargetModel').onchange = () => saveUnifiedRoute({ providerId: route.providerId, model: $('unifiedTargetModel').value }, '固定模型已保存', group);
 }
 async function saveUnifiedRoute(input, message, group = 1) {
-  if (group === 2 ? secondaryRouteSaving : unifiedRouteSaving) return;
-  if (group === 2) secondaryRouteSaving = true; else unifiedRouteSaving = true;
+  if (group === 3 ? thirdRouteSaving : group === 2 ? secondaryRouteSaving : unifiedRouteSaving) return;
+  if (group === 3) thirdRouteSaving = true; else if (group === 2) secondaryRouteSaving = true; else unifiedRouteSaving = true;
   renderUnifiedRoute(group);
   try {
     appState = await window.apiPet.setUnifiedRoute(input, group);
@@ -764,7 +796,7 @@ async function saveUnifiedRoute(input, message, group = 1) {
     try { appState = await window.apiPet.getState(); } catch {}
     toast(`更新固定模型路由失败：${error.message}`);
   } finally {
-    if (group === 2) secondaryRouteSaving = false; else unifiedRouteSaving = false;
+    if (group === 3) thirdRouteSaving = false; else if (group === 2) secondaryRouteSaving = false; else unifiedRouteSaving = false;
     renderMode();
   }
 }
@@ -1688,6 +1720,7 @@ window.addEventListener('DOMContentLoaded', async () => {
   setupPanelHeightResize();
   setupPanelWidthResize();
   setupSettingsTabs();
+  setupRoutingGroupTabs();
   window.apiPet.onBalanceActivity(setBalanceActivity);
   appState = await window.apiPet.getState();
   setBalanceActivity(await window.apiPet.getBalanceActivity());
@@ -1728,7 +1761,20 @@ window.addEventListener('DOMContentLoaded', async () => {
   $('copyUrl').onclick = () => copyGatewayValue('unifiedUrl', 'URL');
   $('refreshAllBalances').onclick = refreshAllProviderBalances;
   $('saveBalanceSettings').onclick = async () => { appState = await window.apiPet.setBalanceSettings({ lowThreshold: $('lowThreshold').value, refreshMinutes: $('refreshMinutes').value }); render(); toast('余额设置已保存'); };
-  for (const group of [1, 2]) {
+  for (const group of [1, 2, 3]) {
+    const saveRequestFormat = async () => {
+      const toggle = routeElement('routingRequestFormatEnabled', group);
+      const select = routeElement('routingRequestFormat', group);
+      const settings = { enabled: toggle.checked, format: select.value };
+      toggle.disabled = true; select.disabled = true;
+      try {
+        appState = await window.apiPet.setRoutingRequestFormat(settings, group);
+        toast(`路由设置${group}${settings.enabled ? `已指定请求格式：${settings.format}` : '已跟随客户端请求格式'}`);
+      } catch (error) { toast(String(error.message || error)); }
+      finally { toggle.disabled = false; renderMode(); }
+    };
+    routeElement('routingRequestFormatEnabled', group).onchange = saveRequestFormat;
+    routeElement('routingRequestFormat', group).onchange = saveRequestFormat;
     routeElement('routingLanAccess', group).onchange = async () => {
       const toggle = routeElement('routingLanAccess', group);
       toggle.disabled = true;
@@ -1738,8 +1784,8 @@ window.addEventListener('DOMContentLoaded', async () => {
       } catch (error) { toast(String(error.message || error)); }
       finally { renderMode(); toggle.disabled = false; }
     };
-    routeElement('copyKey', group).onclick = () => copyGatewayValue('unifiedKey' + (group === 2 ? '2' : ''), `路由设置${group} Key`);
-    routeElement('copyModel', group).onclick = () => copyGatewayValue('unifiedModel' + (group === 2 ? '2' : ''), 'Pet 模型');
+    routeElement('copyKey', group).onclick = () => copyGatewayValue('unifiedKey' + (group > 1 ? String(group) : ''), `路由设置${group} Key`);
+    routeElement('copyModel', group).onclick = () => copyGatewayValue('unifiedModel' + (group > 1 ? String(group) : ''), 'Pet 模型');
     routeElement('routingEnabled', group).onchange = async () => {
       appState = await window.apiPet.setRoutingEnabled(routeElement('routingEnabled', group).checked, group);
       renderMode();

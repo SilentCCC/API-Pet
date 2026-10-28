@@ -8,6 +8,7 @@ const balanceAdapters = require('./providers');
 const { currencySettings, rememberCurrency } = require('./provider-currency');
 const { requestImage, imageData } = require('./image-generation');
 const { detectMime } = require('./image-format');
+const { prepareGatewayRequest, translateGatewayResponse } = require('./gateway-format');
 const { AccountSessions, originOf, credentialsOf } = require('./account-sessions');
 const { configureAccountSessions } = require('./account-session-context');
 const { attachNetworkDiagnostics } = require('./network-diagnostics');
@@ -190,6 +191,8 @@ function defaultState() {
     routes: {},
     routingEnabled: false,
     lanAccess: false,
+    requestFormatEnabled: false,
+    requestFormat: 'responses',
     routingMode: 'model',
     alwaysOnTop: true,
     chatFormat: 'responses',
@@ -197,7 +200,13 @@ function defaultState() {
     keyRoute: { providerId: '', apiKey: '', models: [] },
     secondaryRouting: {
       unifiedKey: `pet-${crypto.randomBytes(18).toString('hex')}`,
-      routingEnabled: false, lanAccess: false, routingMode: 'model', routes: {},
+      routingEnabled: false, lanAccess: false, requestFormatEnabled: false, requestFormat: 'responses', routingMode: 'model', routes: {},
+      unifiedRoute: { providerId: '', apiKey: '', model: '', models: [] },
+      keyRoute: { providerId: '', apiKey: '', models: [] }
+    },
+    thirdRouting: {
+      unifiedKey: `pet-${crypto.randomBytes(18).toString('hex')}`,
+      routingEnabled: false, lanAccess: false, requestFormatEnabled: false, requestFormat: 'responses', routingMode: 'model', routes: {},
       unifiedRoute: { providerId: '', apiKey: '', model: '', models: [] },
       keyRoute: { providerId: '', apiKey: '', models: [] }
     },
@@ -210,27 +219,39 @@ function loadState() {
     const oldTarget = saved.virtualModel?.target || '';
     const defaults = defaultState();
     const providers = Array.isArray(saved.providers) ? saved.providers.map(normalizeProvider) : [];
+    const usedKeys = new Set([saved.unifiedKey || defaults.unifiedKey]);
+    const extraRouting = {};
+    for (const name of ['secondaryRouting', 'thirdRouting']) {
+      const routing = saved[name] || {};
+      const unifiedKey = typeof routing.unifiedKey === 'string' && routing.unifiedKey && !usedKeys.has(routing.unifiedKey)
+        ? routing.unifiedKey : defaults[name].unifiedKey;
+      usedKeys.add(unifiedKey);
+      extraRouting[name] = {
+        ...defaults[name], unifiedKey,
+        routingEnabled: routing.routingEnabled === true,
+        lanAccess: routing.lanAccess === true,
+        requestFormatEnabled: routing.requestFormatEnabled === true,
+        requestFormat: routing.requestFormat === 'chat/completions' ? 'chat/completions' : 'responses',
+        routingMode: ['unified', 'model', 'key'].includes(routing.routingMode) ? routing.routingMode : 'model',
+        routes: routing.routes && typeof routing.routes === 'object' && !Array.isArray(routing.routes) ? routing.routes : {},
+        unifiedRoute: normalizeUnifiedRoute(routing.unifiedRoute, providers),
+        keyRoute: normalizeKeyRoute(routing.keyRoute, providers)
+      };
+    }
     return {
       ...defaults,
       ...saved,
       routingEnabled: saved.routingEnabled === true,
       lanAccess: saved.lanAccess === true,
+      requestFormatEnabled: saved.requestFormatEnabled === true,
+      requestFormat: saved.requestFormat === 'chat/completions' ? 'chat/completions' : 'responses',
       routingMode: ['unified', 'model', 'key'].includes(saved.routingMode) ? saved.routingMode : 'model',
       alwaysOnTop: saved.alwaysOnTop !== false,
       balanceSettings: { ...defaults.balanceSettings, ...(saved.balanceSettings || {}) },
       chatFormat: (saved.chatFormat || (saved.routingMode === 'unified' ? saved.unifiedRoute?.format : '')) === 'chat/completions' ? 'chat/completions' : 'responses',
       unifiedRoute: normalizeUnifiedRoute({ ...saved.unifiedRoute, model: saved.unifiedRoute?.model || oldTarget }, providers),
       keyRoute: normalizeKeyRoute(saved.keyRoute, providers),
-      secondaryRouting: {
-        ...defaults.secondaryRouting,
-        unifiedKey: typeof saved.secondaryRouting?.unifiedKey === 'string' && saved.secondaryRouting.unifiedKey && saved.secondaryRouting.unifiedKey !== saved.unifiedKey ? saved.secondaryRouting.unifiedKey : defaults.secondaryRouting.unifiedKey,
-        routingEnabled: saved.secondaryRouting?.routingEnabled === true,
-        lanAccess: saved.secondaryRouting?.lanAccess === true,
-        routingMode: ['unified', 'model', 'key'].includes(saved.secondaryRouting?.routingMode) ? saved.secondaryRouting.routingMode : 'model',
-        routes: saved.secondaryRouting?.routes && typeof saved.secondaryRouting.routes === 'object' && !Array.isArray(saved.secondaryRouting.routes) ? saved.secondaryRouting.routes : {},
-        unifiedRoute: normalizeUnifiedRoute(saved.secondaryRouting?.unifiedRoute, providers),
-        keyRoute: normalizeKeyRoute(saved.secondaryRouting?.keyRoute, providers)
-      },
+      ...extraRouting,
       providers
     };
   }
@@ -265,11 +286,11 @@ function gatewayAccessAllowed(req, routing) {
   if (address === '::1' || /^127\./.test(address)) return true;
   return routing.lanAccess === true && isLanAddress(address);
 }
-function gatewayListenHost() { return state.lanAccess === true || state.secondaryRouting?.lanAccess === true ? '0.0.0.0' : '127.0.0.1'; }
+function gatewayListenHost() { return state.lanAccess === true || state.secondaryRouting?.lanAccess === true || state.thirdRouting?.lanAccess === true ? '0.0.0.0' : '127.0.0.1'; }
 let gatewaySettingsQueue = Promise.resolve();
 function setRoutingLanAccess(enabled, group = 1) {
   const update = async () => {
-    const routing = group === 2 ? state.secondaryRouting : state;
+    const routing = group === 3 ? state.thirdRouting : group === 2 ? state.secondaryRouting : state;
     const previous = routing.lanAccess === true;
     const oldHost = gatewayListenHost();
     routing.lanAccess = enabled === true;
@@ -501,7 +522,7 @@ async function testProvider(id) {
   try {
     const models = await fetchModels(provider, apiKey);
     provider.models = models; provider.status = 'online'; provider.error = ''; provider.lastChecked = new Date().toISOString(); persist();
-    for (const routing of [state, state.secondaryRouting].filter(Boolean)) {
+    for (const routing of [state, state.secondaryRouting, state.thirdRouting].filter(Boolean)) {
       if (routing.unifiedRoute?.providerId === id && unifiedRouteKey(provider, routing.unifiedRoute) === apiKey) {
         routing.unifiedRoute.models = models;
         if (!models.includes(routing.unifiedRoute.model)) routing.unifiedRoute.model = '';
@@ -1016,6 +1037,7 @@ function gatewayRouting(req) {
   if (!key) return null;
   if (key === state.unifiedKey) return state;
   if (key === state.secondaryRouting?.unifiedKey) return state.secondaryRouting;
+  if (key === state.thirdRouting?.unifiedKey) return state.thirdRouting;
   return null;
 }
 function gatewayCredential(req) {
@@ -1123,15 +1145,19 @@ async function proxyChat(req, res, body, endpoint = '/chat/completions', routing
   if (!provider) return writeJson(res, 404, { error: { message: `No provider configured for model: ${model}`, type: 'api_pet_routing_error' } });
   const apiKey = routing.routingMode === 'key' ? selectedKeyRoute.apiKey : requestedModel === 'Pet model' ? unifiedRouteKey(provider, routing.unifiedRoute) : selectProviderApiKey(provider);
   if (!apiKey) return writeJson(res, 400, { error: { message: '统一路由所选 Key 无效，请重新选择站点、Key 和模型', type: 'api_pet_key_error' } });
+  let prepared;
+  try {
+    const upstreamBody = { ...body, model };
+    delete upstreamBody.api_pet_provider_id;
+    prepared = prepareGatewayRequest(upstreamBody, endpoint, routing);
+  } catch (error) { return writeJson(res, 400, { error: { message: error.message, type: 'api_pet_format_error' } }); }
   const requestStartedAt = Date.now();
   recordProviderRequest(provider);
   persist();
   mainWindow?.webContents.send('gateway-status', { status: 'requesting', model: requestedModel, target: model, provider: provider.name });
   try {
-    // The client chooses the protocol by calling /chat/completions or /responses.
-    const upstreamEndpoint = endpoint;
-    const upstreamBody = { ...body, model };
-    delete upstreamBody.api_pet_provider_id;
+    const upstreamEndpoint = prepared.endpoint;
+    const upstreamBody = prepared.body;
     let upstream;
     let upstreamUrl;
     let lastError;
@@ -1149,6 +1175,12 @@ async function proxyChat(req, res, body, endpoint = '/chat/completions', routing
     if ((upstream.headers.get('content-type') || '').toLowerCase().includes('text/html')) {
       throw new Error(`上游返回了网页而不是 API 响应: ${upstreamUrl}`);
     }
+    if (upstream.ok && upstreamEndpoint !== endpoint) {
+      const result = await translateGatewayResponse(upstream, res, upstreamEndpoint, body);
+      recordProviderResult(provider, requestStartedAt, result.success, extractUsage(result.payload, upstream.headers));
+      mainWindow?.webContents.send('gateway-status', { status: result.success ? 'success' : 'error', model: requestedModel, target: model, provider: provider.name });
+      return;
+    }
     res.writeHead(upstream.status, { 'Content-Type': upstream.headers.get('content-type') || 'application/json', 'Access-Control-Allow-Origin': '*' });
     let responseBytes = 0;
     const contentType = (upstream.headers.get('content-type') || '').toLowerCase();
@@ -1160,7 +1192,7 @@ async function proxyChat(req, res, body, endpoint = '/chat/completions', routing
     if (responseParts.length) { try { usage = { ...usage, ...extractUsage(JSON.parse(Buffer.concat(responseParts).toString('utf8')), upstream.headers) }; } catch {} }
     recordProviderResult(provider, requestStartedAt, status === 'success', usage);
     mainWindow?.webContents.send('gateway-status', { status, model: requestedModel, target: model, provider: provider.name });
-  } catch (e) { recordProviderResult(provider, requestStartedAt, false); writeJson(res, 502, { error: { message: e.message, type: 'api_pet_upstream_error' } }); mainWindow?.webContents.send('gateway-status', { status: 'error', model: requestedModel, target: model, provider: provider.name }); }
+  } catch (e) { recordProviderResult(provider, requestStartedAt, false); if (!res.headersSent && !res.destroyed) writeJson(res, 502, { error: { message: e.message, type: 'api_pet_upstream_error' } }); else if (!res.writableEnded) res.end(); mainWindow?.webContents.send('gateway-status', { status: 'error', model: requestedModel, target: model, provider: provider.name }); }
 }
 function startGateway() {
   gateway = http.createServer(async (req, res) => {
@@ -1410,15 +1442,15 @@ ipcMain.handle('save-provider', (_e, input) => {
   } else state.providers.push(record);
   if (state.unifiedRoute.providerId === record.id) state.unifiedRoute = normalizeUnifiedRoute(state.unifiedRoute);
   if (state.keyRoute?.providerId === record.id) state.keyRoute = normalizeKeyRoute(state.keyRoute);
-  if (state.secondaryRouting) {
-    state.secondaryRouting.unifiedRoute = normalizeUnifiedRoute(state.secondaryRouting.unifiedRoute);
-    state.secondaryRouting.keyRoute = normalizeKeyRoute(state.secondaryRouting.keyRoute);
+  for (const routing of [state.secondaryRouting, state.thirdRouting].filter(Boolean)) {
+    routing.unifiedRoute = normalizeUnifiedRoute(routing.unifiedRoute);
+    routing.keyRoute = normalizeKeyRoute(routing.keyRoute);
   }
   persist(); return safeState();
 });
 ipcMain.handle('delete-provider', (_e, id) => {
   state.providers = state.providers.filter(p => p.id !== id);
-  for (const routing of [state, state.secondaryRouting].filter(Boolean)) {
+  for (const routing of [state, state.secondaryRouting, state.thirdRouting].filter(Boolean)) {
     Object.keys(routing.routes).forEach(model => { if (routing.routes[model] === id) delete routing.routes[model]; });
     if (routing.unifiedRoute.providerId === id) routing.unifiedRoute = { providerId: '', apiKey: '', model: '', models: [] };
     if (routing.keyRoute?.providerId === id) routing.keyRoute = { providerId: '', apiKey: '', models: [] };
@@ -1464,10 +1496,10 @@ ipcMain.handle('set-balance-settings', (_e, settings) => {
   state.balanceSettings = { ...state.balanceSettings, lowThreshold: Math.max(0, Number(settings?.lowThreshold) || 0), refreshMinutes: Math.max(1, Number(settings?.refreshMinutes) || 10) };
   persist(); scheduleBalanceRefresh(); return safeState();
 });
-ipcMain.handle('set-route', (_e, { model, providerId }, group = 1) => { const routing = group === 2 ? state.secondaryRouting : state; routing.routes[model] = providerId; persist(); return safeState(); });
-ipcMain.handle('set-routing-mode', (_e, mode, group = 1) => { const routing = group === 2 ? state.secondaryRouting : state; routing.routingMode = ['unified', 'model', 'key'].includes(mode) ? mode : 'model'; persist(); return safeState(); });
+ipcMain.handle('set-route', (_e, { model, providerId }, group = 1) => { const routing = group === 3 ? state.thirdRouting : group === 2 ? state.secondaryRouting : state; routing.routes[model] = providerId; persist(); return safeState(); });
+ipcMain.handle('set-routing-mode', (_e, mode, group = 1) => { const routing = group === 3 ? state.thirdRouting : group === 2 ? state.secondaryRouting : state; routing.routingMode = ['unified', 'model', 'key'].includes(mode) ? mode : 'model'; persist(); return safeState(); });
 ipcMain.handle('set-key-route', async (_e, route, group = 1) => {
-  const routing = group === 2 ? state.secondaryRouting : state;
+  const routing = group === 3 ? state.thirdRouting : group === 2 ? state.secondaryRouting : state;
   const provider = state.providers.find(item => item.id === String(route?.providerId || ''));
   const index = route?.keyIndex === '' || route?.keyIndex == null ? -1 : Number(route.keyIndex);
   const apiKey = Number.isInteger(index) && index >= 0 ? provider?.apiKeys?.[index]?.key || '' : '';
@@ -1480,10 +1512,19 @@ ipcMain.handle('set-key-route', async (_e, route, group = 1) => {
   }
   return safeState();
 });
-ipcMain.handle('set-routing-enabled', (_e, enabled, group = 1) => { const routing = group === 2 ? state.secondaryRouting : state; routing.routingEnabled = enabled === true; persist(); return safeState(); });
+ipcMain.handle('set-routing-enabled', (_e, enabled, group = 1) => { const routing = group === 3 ? state.thirdRouting : group === 2 ? state.secondaryRouting : state; routing.routingEnabled = enabled === true; persist(); return safeState(); });
 ipcMain.handle('set-routing-lan-access', (_e, enabled, group = 1) => setRoutingLanAccess(enabled, group));
+ipcMain.handle('set-routing-request-format', (_e, settings, group = 1) => {
+  if (!['responses', 'chat/completions'].includes(settings?.format)) throw new Error('不支持的请求格式');
+  const routing = group === 3 ? state.thirdRouting : group === 2 ? state.secondaryRouting : state;
+  const previous = { requestFormatEnabled: routing.requestFormatEnabled, requestFormat: routing.requestFormat };
+  routing.requestFormatEnabled = settings.enabled === true;
+  routing.requestFormat = settings.format;
+  if (!persist()) { Object.assign(routing, previous); throw new Error('请求格式保存失败'); }
+  return safeState();
+});
 ipcMain.handle('set-unified-route', async (_e, route, group = 1) => {
-  const routing = group === 2 ? state.secondaryRouting : state;
+  const routing = group === 3 ? state.thirdRouting : group === 2 ? state.secondaryRouting : state;
   const providerId = String(route?.providerId || '');
   const provider = state.providers.find(p => p.id === providerId);
   if (Object.prototype.hasOwnProperty.call(route, 'keyIndex')) {

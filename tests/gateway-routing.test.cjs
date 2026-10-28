@@ -4,6 +4,7 @@ const fs = require('node:fs');
 const http = require('node:http');
 const path = require('node:path');
 const vm = require('node:vm');
+const { prepareGatewayRequest, translateGatewayResponse } = require('../src/gateway-format');
 const { test } = require('node:test');
 
 const source = fs.readFileSync(path.join(__dirname, '../src/main.js'), 'utf8');
@@ -20,7 +21,7 @@ async function gateway(t, options = {}) {
   const state = { routingEnabled: true, routingMode: 'unified', routes: {}, providers: [provider], unifiedKey: 'test-local-key',
     unifiedRoute: { providerId: 'test', model: 'upstream-model', format: options.legacyFormat }, ...options.state };
   const calls = [];
-  const context = vm.createContext({ state, http: options.remoteAddress ? { createServer: handler => http.createServer((req, res) => {
+  const context = vm.createContext({ state, prepareGatewayRequest, translateGatewayResponse, http: options.remoteAddress ? { createServer: handler => http.createServer((req, res) => {
       Object.defineProperty(req.socket, 'remoteAddress', {value:options.remoteAddress,configurable:true});
       return handler(req,res);
     }) } : http, PORT: 0, Buffer, console, mainWindow: null,
@@ -38,6 +39,13 @@ async function gateway(t, options = {}) {
   const server = context.gateway;
   t.after(() => new Promise(resolve => { server.close(resolve); server.closeAllConnections(); }));
   await new Promise((resolve, reject) => { server.once('listening', resolve); server.once('error', reject); });
+  // Windows can assign port 6000 (or another Fetch-blocked port) for listen(0).
+  // Rebind the isolated test listener rather than making this suite intermittent.
+  const fetchBlockedPorts = new Set([1719, 1720, 1723, 2049, 3659, 4045, 5060, 5061, 6000, 6566, 6665, 6666, 6667, 6668, 6669, 6697, 10080]);
+  while (server.address().port < 1024 || fetchBlockedPorts.has(server.address().port)) {
+    await new Promise(resolve => server.close(resolve));
+    await new Promise((resolve, reject) => { server.once('listening', resolve); server.once('error', reject); server.listen(0, context.gatewayListenHost()); });
+  }
   const base = `http://127.0.0.1:${server.address().port}/v1`;
   const send = (endpoint, body, key = 'test-local-key') => fetch(base + endpoint, {
     method: 'POST', headers: { Authorization: `Bearer ${key}`, 'Content-Type': 'application/json' }, body: JSON.stringify(body)
@@ -117,11 +125,118 @@ test('model routing also follows the client endpoint', async t => {
   }
 });
 
+test('format settings validate, persist independently and roll back on save failure', () => {
+  const handlers = {};
+  const state = { secondaryRouting: {}, chatFormat: 'chat/completions' };
+  let fail = false, saved;
+  const context = vm.createContext({ state, ipcMain: { handle: (name, handler) => { handlers[name] = handler; } },
+    persist() { if (fail) return false; saved = JSON.parse(JSON.stringify(state)); return true; }, safeState: () => state });
+  const start = source.indexOf("ipcMain.handle('set-routing-request-format'");
+  vm.runInContext(source.slice(start, source.indexOf("ipcMain.handle('set-unified-route'", start)), context);
+  const save = (enabled, format, group) => handlers['set-routing-request-format'](null, { enabled, format }, group);
+  save(true, 'responses', 1); save(true, 'chat/completions', 2);
+  assert.equal(saved.requestFormat, 'responses');
+  assert.equal(saved.secondaryRouting.requestFormat, 'chat/completions');
+  assert.equal(saved.chatFormat, 'chat/completions');
+  assert.throws(() => save(true, 'bad', 1), /不支持/);
+  fail = true;
+  assert.throws(() => save(false, 'responses', 2), /保存失败/);
+  assert.equal(state.secondaryRouting.requestFormatEnabled, true);
+  assert.equal(state.secondaryRouting.requestFormat, 'chat/completions');
+});
+
+test('all three routing modes translate to the selected upstream protocol', async t => {
+  for (const routingMode of ['unified', 'model', 'key']) {
+    for (const requestFormat of ['responses', 'chat/completions']) {
+      const responses = requestFormat === 'responses';
+      const { send, calls, state } = await gateway(t, { state: { routingMode, requestFormatEnabled: true, requestFormat,
+        keyRoute: { providerId: 'test', apiKey: 'test-upstream-key', models: ['upstream-model'] } },
+        response: () => responses
+          ? Response.json({ id: 'resp_result', status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'converted' }] }] })
+          : Response.json({ id: 'chat_result', choices: [{ index: 0, message: { role: 'assistant', content: 'converted' }, finish_reason: 'stop' }] }) });
+      state.providers[0].apiKeyModels = { 'test-upstream-key': ['upstream-model'] };
+      const endpoint = responses ? '/chat/completions' : '/responses';
+      const payload = responses ? { messages: [{ role: 'user', content: 'question' }] } : { input: 'question' };
+      const response = await send(endpoint, { model: routingMode === 'unified' ? 'Pet model' : 'upstream-model', ...payload });
+      assert.equal(response.status, 200, `${routingMode}/${requestFormat}: ${await response.clone().text()}`);
+      const result = await response.json();
+      assert.equal(responses ? result.choices[0].message.content : result.output[0].content[0].text, 'converted');
+      assert.equal(calls[0].url, 'https://upstream.test/v1/' + requestFormat);
+      assert.equal(calls[0].body.model, 'upstream-model');
+      assert.equal(calls[0].headers.Authorization, 'Bearer test-upstream-key');
+      assert.equal(responses ? calls[0].body.input[0].content : calls[0].body.messages[0].content, 'question');
+    }
+  }
+});
+
+test('two Keys can translate opposite protocols concurrently without sharing preferences', async t => {
+  const { send, calls, state, context } = await gateway(t, { state: { requestFormatEnabled: true, requestFormat: 'responses',
+    secondaryRouting: { unifiedKey: 'second-local', routingEnabled: true, routingMode: 'unified', requestFormatEnabled: true, requestFormat: 'chat/completions',
+      unifiedRoute: { providerId: 'test', apiKey: 'second-key', model: 'upstream-model', models: ['upstream-model'] } } } });
+  state.providers[0].apiKeys[1].enabled = true;
+  state.providers[0].apiKeyModels = { 'second-key': ['upstream-model'] };
+  // Return the corresponding protocol's JSON, with a small overlap between requests.
+  context.fetch = async (url, request) => {
+    calls.push({ url, headers: request.headers, body: JSON.parse(request.body) });
+    await new Promise(resolve => setTimeout(resolve, 10));
+    return url.endsWith('/responses')
+      ? Response.json({ status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: 'first' }] }] })
+      : Response.json({ choices: [{ index: 0, message: { role: 'assistant', content: 'second' }, finish_reason: 'stop' }] });
+  };
+  const [first, second] = await Promise.all([
+    send('/chat/completions', { model: 'Pet model', messages: [{ role: 'user', content: 'one' }] }),
+    send('/responses', { model: 'Pet model', input: 'two' }, 'second-local')
+  ]);
+  assert.equal(first.status, 200); assert.equal(second.status, 200);
+  assert.equal((await first.json()).choices[0].message.content, 'first');
+  assert.equal((await second.json()).output[0].content[0].text, 'second');
+  assert.equal(calls.find(call => call.url.endsWith('/responses')).headers.Authorization, 'Bearer test-upstream-key');
+  assert.equal(calls.find(call => call.url.endsWith('/chat/completions')).headers.Authorization, 'Bearer second-key');
+  assert.equal(state.requestFormat, 'responses');
+  assert.equal(state.secondaryRouting.requestFormat, 'chat/completions');
+});
+
+test('unsupported conversion returns 400 before sending to the provider; provider errors retain status', async t => {
+  const { send, calls } = await gateway(t, { state: { requestFormatEnabled: true, requestFormat: 'chat/completions' },
+    response: () => Response.json({ error: { message: 'rate limit' } }, { status: 429 }) });
+  const rejected = await send('/responses', { model: 'Pet model', input: 'x', previous_response_id: 'resp_old' });
+  assert.equal(rejected.status, 400);
+  assert.equal((await rejected.json()).error.type, 'api_pet_format_error');
+  assert.equal(calls.length, 0);
+  const error = await send('/responses', { model: 'Pet model', input: 'x' });
+  assert.equal(error.status, 429);
+  assert.equal((await error.json()).error.message, 'rate limit');
+});
+
+test('converted SSE reaches real HTTP clients in their original protocol', async t => {
+  for (const requestFormat of ['responses', 'chat/completions']) {
+    const responses = requestFormat === 'responses';
+    const frames = responses ? [
+      { type: 'response.created', response: { id: 'resp_http', model: 'upstream-model', created_at: 1 } },
+      { type: 'response.output_text.delta', output_index: 0, content_index: 0, delta: '你好' },
+      { type: 'response.completed', response: { status: 'completed', output: [{ type: 'message', content: [{ type: 'output_text', text: '你好' }] }] } }
+    ] : [
+      { id: 'chat_http', model: 'upstream-model', choices: [{ index: 0, delta: { content: '你好' }, finish_reason: null }] },
+      { choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] }
+    ];
+    const { send } = await gateway(t, { state: { requestFormatEnabled: true, requestFormat },
+      response: () => new Response(frames.map(frame => 'data: ' + JSON.stringify(frame) + '\n\n').join(''), { headers: { 'Content-Type': 'text/event-stream' } }) });
+    const result = await send(responses ? '/chat/completions' : '/responses', { model: 'Pet model', stream: true,
+      ...(responses ? { messages: [{ role: 'user', content: 'hello' }] } : { input: 'hello' }) });
+    assert.equal(result.status, 200);
+    assert.match(result.headers.get('content-type'), /text\/event-stream/);
+    const data = await result.text();
+    assert.match(data, /你好/);
+    assert.match(data, responses ? /chat.completion.chunk/ : /event: response.output_text.delta/);
+    assert.match(data, responses ? /\[DONE\]/ : /event: response.completed/);
+  }
+});
+
 test('site Key route maps the local API Pet Key to the selected site Key', async t => {
   const provider = { id: 'site-a', models: [], apiKey: 'site-a-key', apiKeys: [{ key: 'site-a-key', enabled: true }], apiKeyModels: { 'site-a-key': ['a-model'] }, requestUrl: 'https://site-a.test/v1' };
   const state = { routingEnabled: true, routingMode: 'key', routes: {}, providers: [provider], unifiedKey: 'local-key', keyRoute: { providerId: 'site-a', apiKey: 'site-a-key', models: ['a-model'] } };
   const calls = [];
-  const context = vm.createContext({ state, http, PORT: 0, Buffer, console, mainWindow: null,
+  const context = vm.createContext({ state, prepareGatewayRequest, translateGatewayResponse, http, PORT: 0, Buffer, console, mainWindow: null,
     providerModels: item => item.models, providerBaseUrls: item => [item.requestUrl], selectProviderApiKey: item => item.apiKey,
     recordProviderRequest() {}, recordProviderResult() {}, persist() {}, extractUsage: () => ({}),
     fetch: async (url, request) => { calls.push({ url, headers: request.headers, body: JSON.parse(request.body) }); return Response.json({ output_text: 'ok' }); }
@@ -319,9 +434,15 @@ test('second route configuration persists without changing the original Key and 
   assert.equal(migrated.secondaryRouting.routingEnabled, false);
   assert.equal(migrated.lanAccess, false);
   assert.equal(migrated.secondaryRouting.lanAccess, false);
+  assert.equal(migrated.requestFormatEnabled, false);
+  assert.equal(migrated.secondaryRouting.requestFormatEnabled, false);
+  assert.equal(migrated.requestFormat, 'responses');
+  assert.equal(migrated.secondaryRouting.requestFormat, 'responses');
   saved.secondaryRouting = JSON.parse(JSON.stringify(migrated.secondaryRouting));
   saved.secondaryRouting.routingEnabled = true;
   saved.secondaryRouting.lanAccess = true;
+  saved.secondaryRouting.requestFormatEnabled = true;
+  saved.secondaryRouting.requestFormat = 'chat/completions';
   saved.secondaryRouting.routingMode = 'key';
   saved.secondaryRouting.keyRoute = { providerId: 'site', apiKey: 'upstream', models: ['model'] };
   const loaded = context.loadState();
@@ -329,8 +450,97 @@ test('second route configuration persists without changing the original Key and 
   assert.equal(loaded.secondaryRouting.keyRoute.apiKey, 'upstream');
   assert.equal(loaded.secondaryRouting.lanAccess, true);
   assert.equal(loaded.lanAccess, false);
+  assert.equal(loaded.secondaryRouting.requestFormatEnabled, true);
+  assert.equal(loaded.secondaryRouting.requestFormat, 'chat/completions');
+  assert.equal(loaded.requestFormatEnabled, false);
   saved.providers[0].apiKeys = [];
   assert.equal(context.loadState().secondaryRouting.keyRoute.apiKey, '');
+});
+
+test('third group migrates disabled with a unique Key and preserves all saved groups on reload', () => {
+  let saved = { unifiedKey: 'first-local', providers: [], secondaryRouting: { unifiedKey: 'second-local', routingEnabled: true, routingMode: 'key', requestFormatEnabled: true, requestFormat: 'chat/completions' } };
+  const context = vm.createContext({ crypto, fs: { readFileSync: () => JSON.stringify(saved) }, dataPath: () => 'isolated-test', normalizeProvider: item => item });
+  ['defaultState', 'providerModels', 'selectProviderApiKey', 'unifiedRouteKey', 'normalizeUnifiedRoute', 'normalizeKeyRoute', 'loadState'].forEach(name => include(context, name));
+  const loaded = context.loadState();
+  assert.equal(loaded.unifiedKey, 'first-local');
+  assert.equal(loaded.secondaryRouting.unifiedKey, 'second-local');
+  assert.equal(loaded.secondaryRouting.routingEnabled, true);
+  assert.equal(loaded.thirdRouting.routingEnabled, false);
+  assert.equal(loaded.thirdRouting.lanAccess, false);
+  assert.equal(loaded.thirdRouting.requestFormatEnabled, false);
+  assert.equal(new Set([loaded.unifiedKey, loaded.secondaryRouting.unifiedKey, loaded.thirdRouting.unifiedKey]).size, 3);
+  saved = JSON.parse(JSON.stringify(loaded));
+  saved.thirdRouting.routingEnabled = true; saved.thirdRouting.lanAccess = true;
+  saved.thirdRouting.requestFormatEnabled = true; saved.thirdRouting.requestFormat = 'chat/completions';
+  const reloaded = context.loadState();
+  assert.deepEqual(JSON.parse(JSON.stringify(reloaded.thirdRouting)), saved.thirdRouting);
+  assert.deepEqual(JSON.parse(JSON.stringify(reloaded.secondaryRouting)), saved.secondaryRouting);
+  saved.thirdRouting.unifiedKey = saved.secondaryRouting.unifiedKey;
+  assert.notEqual(context.loadState().thirdRouting.unifiedKey, saved.secondaryRouting.unifiedKey);
+});
+
+for (const modes of [['unified', 'model', 'key'], ['key', 'unified', 'model'], ['model', 'key', 'unified']]) {
+  test(`three local Keys isolate simultaneous ${modes.join('/')} routes and disabled groups`, async t => {
+    const providers = ['a', 'b', 'c'].map(id => ({ id, models: ['shared-model'], apiKey: `${id}-key`, apiKeys: [{ key: `${id}-key`, enabled: true }], apiKeyModels: { [`${id}-key`]: ['shared-model'] }, requestUrl: `https://${id}.test/v1` }));
+    const config = (provider, routingMode) => ({ routingEnabled: true, routingMode, unifiedKey: `${provider.id}-local`, routes: { 'shared-model': provider.id },
+      unifiedRoute: { providerId: provider.id, apiKey: provider.apiKey, model: 'shared-model', models: ['shared-model'] }, keyRoute: { providerId: provider.id, apiKey: provider.apiKey, models: ['shared-model'] } });
+    const groups = providers.map((provider, index) => config(provider, modes[index]));
+    const { send, calls, base, state } = await gateway(t, { state: { ...groups[0], secondaryRouting: groups[1], thirdRouting: groups[2], providers } });
+    const results = await Promise.all(groups.map((group, index) => send('/responses', { model: modes[index] === 'unified' ? 'Pet model' : 'shared-model', input: 'hello' }, group.unifiedKey)));
+    for (const result of results) { assert.equal(result.status, 200); await result.text(); }
+    for (const provider of providers) assert.ok(calls.some(call => call.url === `https://${provider.id}.test/v1/responses` && call.headers.Authorization === `Bearer ${provider.apiKey}`));
+    for (const [index, group] of [state, state.secondaryRouting, state.thirdRouting].entries()) {
+      group.routingEnabled = false;
+      const models = await fetch(base + '/models', { headers: { Authorization: `Bearer ${group.unifiedKey}` } });
+      assert.deepEqual((await models.json()).data, []);
+      const denied = await send('/responses', { model: modes[index] === 'unified' ? 'Pet model' : 'shared-model' }, group.unifiedKey);
+      assert.equal(denied.status, 400); await denied.text();
+      group.routingEnabled = true;
+    }
+    assert.equal((await send('/responses', { model: 'shared-model' }, 'wrong-key')).status, 401);
+  });
+}
+
+test('third group IPC settings and pending model discovery do not change either existing group', async () => {
+  const handlers = {};
+  const config = () => ({ routes: {}, unifiedRoute: {}, keyRoute: {}, routingMode: 'model', routingEnabled: false });
+  const state = { ...config(), secondaryRouting: config(), thirdRouting: config(), providers: [{ id: 'site', models: ['third-model'], apiKeys: [{ key: 'third-key' }] }] };
+  const before = JSON.stringify([state.routes, state.unifiedRoute, state.keyRoute, state.secondaryRouting]);
+  let saved;
+  const context = vm.createContext({ state, ipcMain: { handle: (name, fn) => { handlers[name] = fn; } }, persist() { saved = JSON.parse(JSON.stringify(state)); return true; }, safeState: () => state,
+    fetchModels: async () => ['third-model'], modelsForApiKey: async () => ['third-model'], providerModels: item => item.models });
+  include(context, 'unifiedRouteKey');
+  vm.runInContext(source.slice(source.indexOf("ipcMain.handle('set-route'"), source.indexOf("ipcMain.handle('quit'")), context);
+  handlers['set-routing-enabled'](null, true, 3);
+  handlers['set-routing-mode'](null, 'unified', 3);
+  handlers['set-route'](null, { model: 'third-model', providerId: 'site' }, 3);
+  handlers['set-routing-request-format'](null, { enabled: true, format: 'chat/completions' }, 3);
+  await handlers['set-unified-route'](null, { providerId: 'site', keyIndex: 0 }, 3);
+  await handlers['set-unified-route'](null, { providerId: 'site', model: 'third-model' }, 3);
+  await handlers['set-key-route'](null, { providerId: 'site', keyIndex: 0 }, 3);
+  assert.equal(saved.thirdRouting.routingEnabled, true);
+  assert.equal(saved.thirdRouting.routes['third-model'], 'site');
+  assert.equal(saved.thirdRouting.unifiedRoute.model, 'third-model');
+  assert.equal(saved.thirdRouting.keyRoute.apiKey, 'third-key');
+  assert.equal(saved.thirdRouting.requestFormat, 'chat/completions');
+  assert.equal(JSON.stringify([state.routes, state.unifiedRoute, state.keyRoute, state.secondaryRouting]), before);
+});
+
+test('provider deletion clears matching targets in all three groups without clearing other routes', () => {
+  const handlers = {};
+  const config = () => ({ routes: { removed: 'removed', kept: 'kept' }, unifiedRoute: { providerId: 'removed' }, keyRoute: { providerId: 'removed' } });
+  const state = { ...config(), secondaryRouting: config(), thirdRouting: config(), providers: [{ id: 'removed' }, { id: 'kept' }] };
+  const context = vm.createContext({ state, ipcMain: { handle: (name, handler) => { handlers[name] = handler; } }, persist() {}, safeState: () => state });
+  const start = source.indexOf("ipcMain.handle('delete-provider'");
+  vm.runInContext(source.slice(start, source.indexOf("ipcMain.handle('test-provider'", start)), context);
+  handlers['delete-provider'](null, 'removed');
+  assert.deepEqual(state.providers, [{ id: 'kept' }]);
+  for (const group of [state, state.secondaryRouting, state.thirdRouting]) {
+    assert.equal(group.routes.removed, undefined);
+    assert.equal(group.routes.kept, 'kept');
+    assert.equal(group.unifiedRoute.providerId, '');
+    assert.equal(group.keyRoute.providerId, '');
+  }
 });
 
 test('IPC selections, mode switches and pending model fetches stay within their route group', async () => {
@@ -368,11 +578,12 @@ test('IPC selections, mode switches and pending model fetches stay within their 
 
 
 test('LAN access follows the authenticated route Key for both model lists and forwarding', async t => {
-  for (const allowedGroup of [1,2]) {
-    const first = {lanAccess:allowedGroup===1, secondaryRouting:{unifiedKey:'second-local',routingEnabled:true,routingMode:'unified',routes:{},unifiedRoute:{providerId:'test',model:'upstream-model'},lanAccess:allowedGroup===2}};
+  for (const allowedGroup of [1,2,3]) {
+    const first = {lanAccess:allowedGroup===1, secondaryRouting:{unifiedKey:'second-local',routingEnabled:true,routingMode:'unified',routes:{},unifiedRoute:{providerId:'test',model:'upstream-model'},lanAccess:allowedGroup===2},
+      thirdRouting:{unifiedKey:'third-local',routingEnabled:true,routingMode:'unified',routes:{},unifiedRoute:{providerId:'test',model:'upstream-model'},lanAccess:allowedGroup===3}};
     const {base,send,calls,server}=await gateway(t,{state:first,remoteAddress:'192.168.0.22'});
     assert.equal(server.address().address,'0.0.0.0');
-    for (const [group,key] of [[1,'test-local-key'],[2,'second-local']]) {
+    for (const [group,key] of [[1,'test-local-key'],[2,'second-local'],[3,'third-local']]) {
       const expected=group===allowedGroup?200:403;
       const models=await fetch(base+'/models',{headers:{Authorization:'Bearer '+key,'X-Forwarded-For':'127.0.0.1'}});
       assert.equal(models.status,expected);
@@ -406,6 +617,7 @@ test('independent LAN switches rebind immediately and serialize overlapping upda
   const {context,state,server}=await gateway(t);
   assert.equal(server.address().address,'127.0.0.1');
   state.secondaryRouting={lanAccess:false};
+  state.thirdRouting={lanAccess:false};
   context.safeState=()=>JSON.parse(JSON.stringify(state));
   vm.runInContext('let gatewaySettingsQueue = Promise.resolve()',context);
   ['restartGateway','setRoutingLanAccess'].forEach(name=>include(context,name));
@@ -418,7 +630,11 @@ test('independent LAN switches rebind immediately and serialize overlapping upda
   assert.equal(state.lanAccess,true);
   assert.equal(state.secondaryRouting.lanAccess,false);
   assert.equal(context.gateway.address().address,'0.0.0.0');
+  await context.setRoutingLanAccess(true,3);
   await context.setRoutingLanAccess(false,1);
+  assert.equal(context.gateway.address().address,'0.0.0.0');
+  assert.equal(state.thirdRouting.lanAccess,true);
+  await context.setRoutingLanAccess(false,3);
   assert.equal(context.gateway.address().address,'127.0.0.1');
   const response=await fetch('http://127.0.0.1:'+context.gateway.address().port+'/v1/models',{headers:{Authorization:'Bearer test-local-key'}});
   assert.equal(response.status,200);
